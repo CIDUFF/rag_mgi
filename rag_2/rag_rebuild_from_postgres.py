@@ -394,17 +394,39 @@ def reconstruir_banco_vetorial(empresa: str, chunks: List[Document]):
         persist_directory=chroma_dir
     )
     
-    # 4. Salvar registro
+    # 4. Salvar registro detalhado dos documentos processados
+    # Extrair IDs únicos de cada tipo de documento
+    artigos_ids = set()
+    paginas_ids = set()
+    noticias_ids = set()
+    
+    for chunk in chunks:
+        doc_type = chunk.metadata.get('type', '')
+        db_id = chunk.metadata.get('db_id')
+        if db_id:
+            if doc_type == 'artigo':
+                artigos_ids.add(db_id)
+            elif doc_type == 'pagina':
+                paginas_ids.add(db_id)
+            elif doc_type == 'noticia':
+                noticias_ids.add(db_id)
+    
     registro = {
         'empresa': empresa,
         'data_criacao': datetime.now().isoformat(),
-        'total_documentos': len(chunks),
+        'data_atualizacao': datetime.now().isoformat(),
+        'total_chunks': len(chunks),
         'fonte': 'PostgreSQL (mgi_raspagem)',
-        'tabelas': [
-            f'tbl_artigos_{empresa.lower()}',
-            f'tbl_paginas_{empresa.lower()}',
-            'tbl_noticias (via tbl_resultados_busca)'
-        ]
+        'estatisticas': {
+            'artigos': len(artigos_ids),
+            'paginas': len(paginas_ids),
+            'noticias': len(noticias_ids)
+        },
+        'documentos_processados': {
+            'artigos': sorted(list(artigos_ids)),
+            'paginas': sorted(list(paginas_ids)),
+            'noticias': sorted(list(noticias_ids))
+        }
     }
     
     with open(processed_file, 'w', encoding='utf-8') as f:
