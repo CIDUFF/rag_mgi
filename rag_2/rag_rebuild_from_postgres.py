@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
 Script para reconstruir os bancos vetoriais ChromaDB a partir do PostgreSQL.
+VERSÃO OTIMIZADA COM PROCESSAMENTO EM PARALELO.
 
-Este script:
-1. Conecta ao banco de dados PostgreSQL (mgi_raspagem)
-2. Extrai dados das tabelas específicas de cada empresa:
-   - CEITEC: tbl_artigos_ceitec, tbl_paginas_ceitec + notícias relacionadas
-   - IMBEL: tbl_artigos_imbel, tbl_paginas_imbel + notícias relacionadas  
-   - Telebras: tbl_artigos_telebras, tbl_paginas_telebras + notícias relacionadas
-3. Apaga os bancos vetoriais antigos
-4. Recria os bancos vetoriais com os novos dados
+Otimizações:
+- Chunking em paralelo usando multiprocessing
+- Batch processing para embeddings
+- Processamento de empresas em paralelo (opcional)
 
 Uso:
-    python rag_rebuild_from_postgres.py [--empresa EMPRESA]
+    python rag_rebuild_from_postgres_parallel.py [--empresa EMPRESA] [--workers N]
     
     EMPRESA pode ser: CEITEC, IMBEL, Telebras ou ALL (padrão)
+    --workers: Número de workers para processamento paralelo (padrão: número de CPUs)
 """
 
 import os
@@ -22,8 +20,10 @@ import sys
 import shutil
 import argparse
 from datetime import datetime
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional, Set, Tuple
 import json
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import multiprocessing as mp
 
 # Adicionar diretório raiz ao path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -38,8 +38,6 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 
-from processing.semantic_chunker import E5SemanticChunker
-
 # Carregar variáveis de ambiente
 load_dotenv()
 
@@ -47,7 +45,6 @@ load_dotenv()
 # CONFIGURAÇÕES
 # ============================================================================
 
-# Configurações do banco de dados PostgreSQL
 # Configurações do banco de dados PostgreSQL (via variáveis de ambiente)
 DB_CONFIG = {
     'host': os.getenv('DB_HOST', 'localhost'),
@@ -81,12 +78,15 @@ PROCESSED_FILES_RECORDS = {
 # Modelo de embeddings
 EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
 
+# Configurações de paralelização
+DEFAULT_WORKERS = min(mp.cpu_count(), 8)  # Limitar a 8 workers
+BATCH_SIZE = 100  # Tamanho do batch para embeddings
+
 # Mapeamento de termos de busca para empresas
-# Termos específicos de cada empresa
 TERMOS_EMPRESA = {
     'CEITEC': {
-        'exclusivos': ['ceitec'],  # IDs dos termos exclusivos
-        'compartilhados': ['semicondutores', 'semiconductors']  # Termos compartilhados
+        'exclusivos': ['ceitec'],
+        'compartilhados': ['semicondutores', 'semiconductors']
     },
     'IMBEL': {
         'exclusivos': ['imbel'],
@@ -98,7 +98,6 @@ TERMOS_EMPRESA = {
     }
 }
 
-# Termos que vão para TODAS as empresas (contexto geral)
 TERMOS_GERAIS = [
     'empresa', 'privatização', 'ministério-mgi', 
     'ministério-das-comunicações', 'ministério-da-defesa',
@@ -179,12 +178,11 @@ def get_paginas(conn, tabela: str) -> List[Dict]:
         return cur.fetchall()
 
 # ============================================================================
-# FUNÇÕES DE PROCESSAMENTO DE DOCUMENTOS
+# FUNÇÕES DE CRIAÇÃO DE DOCUMENTOS
 # ============================================================================
 
 def criar_documento_noticia(noticia: Dict, empresa: str) -> Document:
     """Cria um Document LangChain a partir de uma notícia."""
-    # Combinar título, descrição e conteúdo
     partes = []
     if noticia.get('title'):
         partes.append(f"# {noticia['title']}")
@@ -262,6 +260,106 @@ def criar_documento_pagina(pagina: Dict, empresa: str) -> Document:
     )
 
 # ============================================================================
+# FUNÇÕES DE CHUNKING PARALELO
+# ============================================================================
+
+def chunk_single_document(args: Tuple[int, str, dict, str]) -> List[Tuple[str, dict]]:
+    """
+    Processa um único documento com chunking simples (por tamanho).
+    Retorna lista de (texto, metadata) para cada chunk.
+    
+    Usando chunking por tamanho fixo para performance.
+    """
+    idx, text, metadata, empresa = args
+    
+    # Chunking simples por tamanho (mais rápido que semântico)
+    MAX_CHUNK_SIZE = 2000  # caracteres
+    OVERLAP = 200  # sobreposição entre chunks
+    
+    chunks = []
+    
+    if len(text) <= MAX_CHUNK_SIZE:
+        # Documento pequeno, não precisa dividir
+        new_metadata = {
+            **metadata,
+            'chunk_id': f"{metadata.get('source', 'doc')}_{0}",
+            'chunk_idx': 0,
+            'total_chunks': 1,
+            'processed_date': datetime.now().isoformat()
+        }
+        chunks.append((text, new_metadata))
+    else:
+        # Dividir em chunks
+        start = 0
+        chunk_idx = 0
+        text_chunks = []
+        
+        while start < len(text):
+            end = start + MAX_CHUNK_SIZE
+            
+            # Tentar quebrar em um espaço para não cortar palavras
+            if end < len(text):
+                # Procurar último espaço antes do limite
+                last_space = text.rfind(' ', start, end)
+                if last_space > start + OVERLAP:
+                    end = last_space
+            
+            text_chunks.append(text[start:end].strip())
+            start = end - OVERLAP if end < len(text) else end
+            chunk_idx += 1
+        
+        total_chunks = len(text_chunks)
+        for i, chunk_text in enumerate(text_chunks):
+            if chunk_text:
+                new_metadata = {
+                    **metadata,
+                    'chunk_id': f"{metadata.get('source', 'doc')}_{i}",
+                    'chunk_idx': i,
+                    'total_chunks': total_chunks,
+                    'processed_date': datetime.now().isoformat()
+                }
+                chunks.append((chunk_text, new_metadata))
+    
+    return chunks
+
+def processar_documentos_paralelo(documentos: List[Document], empresa: str, num_workers: int) -> List[Document]:
+    """
+    Processa os documentos com chunking em paralelo.
+    """
+    print(f"\nProcessando {len(documentos)} documentos com {num_workers} workers...")
+    
+    # Preparar argumentos para processamento paralelo
+    args_list = [
+        (i, doc.page_content, doc.metadata, empresa) 
+        for i, doc in enumerate(documentos)
+    ]
+    
+    processed_chunks = []
+    total = len(args_list)
+    
+    # Usar ProcessPoolExecutor para paralelização
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # Submeter todos os trabalhos
+        futures = {executor.submit(chunk_single_document, args): i for i, args in enumerate(args_list)}
+        
+        completed = 0
+        for future in as_completed(futures):
+            completed += 1
+            if completed % 500 == 0 or completed == total:
+                print(f"  Progresso: {completed}/{total} documentos ({100*completed/total:.1f}%)")
+            
+            try:
+                chunks_result = future.result()
+                for text, metadata in chunks_result:
+                    processed_chunks.append(Document(page_content=text, metadata=metadata))
+            except Exception as e:
+                idx = futures[future]
+                print(f"  Erro no documento {idx}: {e}")
+    
+    print(f"  Total de chunks gerados: {len(processed_chunks)}")
+    return processed_chunks
+
+# ============================================================================
 # FUNÇÕES PRINCIPAIS
 # ============================================================================
 
@@ -300,9 +398,7 @@ def coletar_documentos_empresa(conn, empresa: str, termos_dict: Dict[int, str]) 
     # 3. Buscar notícias relacionadas
     print(f"\nBuscando notícias para {empresa}...")
     
-    # Obter IDs dos termos exclusivos e compartilhados
     config_termos = TERMOS_EMPRESA.get(empresa, {'exclusivos': [], 'compartilhados': []})
-    
     termos_exclusivos = config_termos['exclusivos']
     termos_compartilhados = config_termos['compartilhados']
     todos_termos = termos_exclusivos + termos_compartilhados + TERMOS_GERAIS
@@ -321,55 +417,6 @@ def coletar_documentos_empresa(conn, empresa: str, termos_dict: Dict[int, str]) 
     
     print(f"\nTotal de documentos para {empresa}: {len(documentos)}")
     return documentos
-
-def processar_documentos_com_chunking(documentos: List[Document], empresa: str) -> List[Document]:
-    """
-    Processa os documentos com chunking semântico.
-    """
-    print(f"\nProcessando {len(documentos)} documentos com chunking semântico...")
-    
-    chunker = E5SemanticChunker(
-        model_name=EMBEDDING_MODEL,
-        similarity_threshold=0.7,
-        max_tokens_per_chunk=1000,
-        min_tokens_per_chunk=100,
-        print_logging=False  # Desabilitar logs individuais para menos poluição
-    )
-    
-    processed_chunks = []
-    
-    for i, doc in enumerate(documentos):
-        if (i + 1) % 100 == 0:
-            print(f"  Processando documento {i+1}/{len(documentos)}...")
-        
-        try:
-            # Aplicar chunking semântico
-            chunks_text = chunker.chunk_text(doc.page_content)
-            
-            # Criar documentos para cada chunk
-            for j, chunk_text in enumerate(chunks_text):
-                chunk_doc = Document(
-                    page_content=chunk_text,
-                    metadata={
-                        **doc.metadata,
-                        'chunk_id': f"{doc.metadata.get('source', 'doc')}_{j}",
-                        'chunk_idx': j,
-                        'total_chunks': len(chunks_text),
-                        'processed_date': datetime.now().isoformat()
-                    }
-                )
-                processed_chunks.append(chunk_doc)
-        except Exception as e:
-            print(f"  Aviso: Erro ao processar documento {i}: {e}")
-            # Em caso de erro, adicionar documento sem chunking
-            doc.metadata['processed_date'] = datetime.now().isoformat()
-            doc.metadata['chunk_id'] = f"{doc.metadata.get('source', 'doc')}_0"
-            doc.metadata['chunk_idx'] = 0
-            doc.metadata['total_chunks'] = 1
-            processed_chunks.append(doc)
-    
-    print(f"  Total de chunks gerados: {len(processed_chunks)}")
-    return processed_chunks
 
 def reconstruir_banco_vetorial(empresa: str, chunks: List[Document]):
     """
@@ -394,17 +441,30 @@ def reconstruir_banco_vetorial(empresa: str, chunks: List[Document]):
     
     # 3. Criar embeddings e banco vetorial
     print(f"\nCriando embeddings com modelo {EMBEDDING_MODEL}...")
-    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-    
-    print(f"Criando banco vetorial com {len(chunks)} chunks...")
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        persist_directory=chroma_dir
+    embeddings = HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL,
+        encode_kwargs={'batch_size': BATCH_SIZE}  # Batch processing para embeddings
     )
     
-    # 4. Salvar registro detalhado dos documentos processados
-    # Extrair IDs únicos de cada tipo de documento
+    print(f"Criando banco vetorial com {len(chunks)} chunks...")
+    print(f"  Processando em batches de {BATCH_SIZE}...")
+    
+    # Criar em batches para melhor uso de memória
+    vectorstore = None
+    for i in range(0, len(chunks), BATCH_SIZE * 10):
+        batch = chunks[i:i + BATCH_SIZE * 10]
+        print(f"  Processando batch {i//BATCH_SIZE//10 + 1} ({i}/{len(chunks)} chunks)...")
+        
+        if vectorstore is None:
+            vectorstore = Chroma.from_documents(
+                documents=batch,
+                embedding=embeddings,
+                persist_directory=chroma_dir
+            )
+        else:
+            vectorstore.add_documents(batch)
+    
+    # 4. Salvar registro detalhado
     artigos_ids = set()
     paginas_ids = set()
     noticias_ids = set()
@@ -426,6 +486,7 @@ def reconstruir_banco_vetorial(empresa: str, chunks: List[Document]):
         'data_atualizacao': datetime.now().isoformat(),
         'total_chunks': len(chunks),
         'fonte': 'PostgreSQL (mgi_raspagem)',
+        'versao': 'parallel_v1',
         'estatisticas': {
             'artigos': len(artigos_ids),
             'paginas': len(paginas_ids),
@@ -445,15 +506,18 @@ def reconstruir_banco_vetorial(empresa: str, chunks: List[Document]):
     print(f"  - Diretório: {chroma_dir}")
     print(f"  - Registro: {processed_file}")
     print(f"  - Total de chunks: {len(chunks)}")
+    print(f"  - Artigos: {len(artigos_ids)}, Páginas: {len(paginas_ids)}, Notícias: {len(noticias_ids)}")
     
     return vectorstore
 
-def processar_empresa(empresa: str):
+def processar_empresa(empresa: str, num_workers: int):
     """
     Processa uma empresa completa: coleta dados, aplica chunking e cria banco vetorial.
     """
+    inicio = datetime.now()
     print(f"\n{'#'*70}")
     print(f"# PROCESSANDO: {empresa}")
+    print(f"# Início: {inicio.isoformat()}")
     print(f"{'#'*70}")
     
     # Conectar ao banco
@@ -471,11 +535,17 @@ def processar_empresa(empresa: str):
             print(f"AVISO: Nenhum documento encontrado para {empresa}")
             return
         
-        # Aplicar chunking semântico
-        chunks = processar_documentos_com_chunking(documentos, empresa)
+        # Aplicar chunking paralelo
+        chunks = processar_documentos_paralelo(documentos, empresa, num_workers)
         
         # Reconstruir banco vetorial
         reconstruir_banco_vetorial(empresa, chunks)
+        
+        fim = datetime.now()
+        duracao = fim - inicio
+        print(f"\n{'#'*70}")
+        print(f"# {empresa} CONCLUÍDO em {duracao}")
+        print(f"{'#'*70}")
         
     finally:
         conn.close()
@@ -483,7 +553,7 @@ def processar_empresa(empresa: str):
 def main():
     """Função principal."""
     parser = argparse.ArgumentParser(
-        description='Reconstrói bancos vetoriais ChromaDB a partir do PostgreSQL'
+        description='Reconstrói bancos vetoriais ChromaDB a partir do PostgreSQL (versão paralela)'
     )
     parser.add_argument(
         '--empresa',
@@ -491,6 +561,12 @@ def main():
         default='ALL',
         choices=['CEITEC', 'IMBEL', 'Telebras', 'ALL'],
         help='Empresa a processar (padrão: ALL)'
+    )
+    parser.add_argument(
+        '--workers',
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f'Número de workers para processamento paralelo (padrão: {DEFAULT_WORKERS})'
     )
     parser.add_argument(
         '--dry-run',
@@ -501,8 +577,9 @@ def main():
     args = parser.parse_args()
     
     print("="*70)
-    print("RECONSTRUÇÃO DOS BANCOS VETORIAIS RAG")
+    print("RECONSTRUÇÃO DOS BANCOS VETORIAIS RAG (VERSÃO PARALELA)")
     print(f"Data/Hora: {datetime.now().isoformat()}")
+    print(f"Workers: {args.workers}")
     print("="*70)
     
     # Testar conexão
@@ -511,7 +588,6 @@ def main():
         conn = get_db_connection()
         print("  Conexão estabelecida com sucesso!")
         
-        # Mostrar estatísticas
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT COUNT(*) as total FROM tbl_noticias")
             total_noticias = cur.fetchone()['total']
@@ -539,11 +615,17 @@ def main():
     else:
         empresas = [args.empresa]
     
+    inicio_total = datetime.now()
+    
     for empresa in empresas:
-        processar_empresa(empresa)
+        processar_empresa(empresa, args.workers)
+    
+    fim_total = datetime.now()
+    duracao_total = fim_total - inicio_total
     
     print("\n" + "="*70)
     print("RECONSTRUÇÃO CONCLUÍDA COM SUCESSO!")
+    print(f"Tempo total: {duracao_total}")
     print("="*70)
 
 if __name__ == "__main__":

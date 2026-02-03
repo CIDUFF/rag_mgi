@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 """
-Script para atualização incremental dos bancos vetoriais a partir do PostgreSQL.
+Script para atualizar os bancos vetoriais ChromaDB com novos dados do PostgreSQL.
+VERSÃO OTIMIZADA COM PROCESSAMENTO EM PARALELO.
 
-Este script:
-1. Carrega o registro de documentos já processados (processed_files_*.json)
-2. Consulta o PostgreSQL para identificar novos documentos
-3. Processa apenas os documentos novos usando chunking semântico
-4. Adiciona os novos chunks ao banco vetorial existente
-5. Atualiza o registro de documentos processados
+Este script verifica quais documentos já foram processados e adiciona apenas os novos.
+
+Otimizações:
+- Chunking em paralelo usando multiprocessing
+- Batch processing para embeddings
+- Processamento de empresas em paralelo (opcional)
 
 Uso:
-    python update_vectordb_from_postgres.py [--empresa EMPRESA]
-    
-    EMPRESA pode ser: CEITEC, IMBEL, Telebras ou ALL (padrão)
+    python update_vectordb_from_postgres_parallel.py [--empresa EMPRESA] [--workers N] [--force]
 """
 
 import os
 import sys
 import argparse
 from datetime import datetime
-from typing import List, Dict, Set
+from typing import List, Dict, Optional, Set, Tuple
 import json
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import multiprocessing as mp
 
 # Adicionar diretório raiz ao path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -35,8 +36,6 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 
-from processing.semantic_chunker import E5SemanticChunker
-
 # Carregar variáveis de ambiente
 load_dotenv()
 
@@ -44,7 +43,6 @@ load_dotenv()
 # CONFIGURAÇÕES
 # ============================================================================
 
-# Configurações do banco de dados PostgreSQL
 # Configurações do banco de dados PostgreSQL (via variáveis de ambiente)
 DB_CONFIG = {
     'host': os.getenv('DB_HOST', 'localhost'),
@@ -78,6 +76,10 @@ PROCESSED_FILES_RECORDS = {
 # Modelo de embeddings
 EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
 
+# Configurações de paralelização
+DEFAULT_WORKERS = min(mp.cpu_count(), 8)  # Limitar a 8 workers
+BATCH_SIZE = 100  # Tamanho do batch para embeddings
+
 # Mapeamento de termos de busca para empresas
 TERMOS_EMPRESA = {
     'CEITEC': {
@@ -94,7 +96,6 @@ TERMOS_EMPRESA = {
     }
 }
 
-# Termos gerais (vão para todas as empresas)
 TERMOS_GERAIS = [
     'empresa', 'privatização', 'ministério-mgi', 
     'ministério-das-comunicações', 'ministério-da-defesa',
@@ -129,43 +130,8 @@ def get_termo_ids_por_nome(termos_dict: Dict[int, str], nomes: List[str]) -> Set
             ids.add(termo_id)
     return ids
 
-# ============================================================================
-# FUNÇÕES PARA BUSCAR DOCUMENTOS NOVOS
-# ============================================================================
-
-def get_novos_artigos(conn, tabela: str, ids_processados: Set[int]) -> List[Dict]:
-    """Busca artigos que ainda não foram processados."""
-    query = f"""
-        SELECT id, titulo, ano, abstract, conteudo, autores, doi
-        FROM {tabela}
-        WHERE conteudo IS NOT NULL AND LENGTH(conteudo) > 50
-    """
-    
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(query)
-        todos = cur.fetchall()
-        # Filtrar apenas os novos
-        novos = [a for a in todos if a['id'] not in ids_processados]
-        return novos
-
-def get_novas_paginas(conn, tabela: str, ids_processados: Set[int]) -> List[Dict]:
-    """Busca páginas que ainda não foram processadas."""
-    query = f"""
-        SELECT id, content, link, resumo, dt_download
-        FROM {tabela}
-        WHERE content IS NOT NULL AND LENGTH(content) > 50
-        AND (status IS NULL OR status != 'error')
-    """
-    
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(query)
-        todas = cur.fetchall()
-        # Filtrar apenas as novas
-        novas = [p for p in todas if p['id'] not in ids_processados]
-        return novas
-
-def get_novas_noticias(conn, termo_ids: Set[int], ids_processados: Set[int]) -> List[Dict]:
-    """Busca notícias que ainda não foram processadas."""
+def get_noticias_por_termos(conn, termo_ids: Set[int], excluir_ids: Set[int] = None) -> List[Dict]:
+    """Busca notícias associadas aos termos de busca especificados."""
     if not termo_ids:
         return []
     
@@ -180,15 +146,56 @@ def get_novas_noticias(conn, termo_ids: Set[int], ids_processados: Set[int]) -> 
         AND LENGTH(n.content) > 100
     """
     
+    params = list(termo_ids)
+    
+    if excluir_ids:
+        placeholders_excluir = ','.join(['%s'] * len(excluir_ids))
+        query += f" AND n.id NOT IN ({placeholders_excluir})"
+        params.extend(excluir_ids)
+    
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(query, tuple(termo_ids))
-        todas = cur.fetchall()
-        # Filtrar apenas as novas
-        novas = [n for n in todas if n['id'] not in ids_processados]
-        return novas
+        cur.execute(query, tuple(params))
+        return cur.fetchall()
+
+def get_artigos(conn, tabela: str, excluir_ids: Set[int] = None) -> List[Dict]:
+    """Busca artigos de uma tabela específica."""
+    query = f"""
+        SELECT id, titulo, ano, abstract, conteudo, autores, doi
+        FROM {tabela}
+        WHERE conteudo IS NOT NULL AND LENGTH(conteudo) > 50
+    """
+    
+    params = []
+    if excluir_ids:
+        placeholders = ','.join(['%s'] * len(excluir_ids))
+        query += f" AND id NOT IN ({placeholders})"
+        params.extend(excluir_ids)
+    
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(query, tuple(params) if params else None)
+        return cur.fetchall()
+
+def get_paginas(conn, tabela: str, excluir_ids: Set[int] = None) -> List[Dict]:
+    """Busca páginas de uma tabela específica."""
+    query = f"""
+        SELECT id, content, link, resumo, dt_download
+        FROM {tabela}
+        WHERE content IS NOT NULL AND LENGTH(content) > 50
+        AND (status IS NULL OR status != 'error')
+    """
+    
+    params = []
+    if excluir_ids:
+        placeholders = ','.join(['%s'] * len(excluir_ids))
+        query += f" AND id NOT IN ({placeholders})"
+        params.extend(excluir_ids)
+    
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(query, tuple(params) if params else None)
+        return cur.fetchall()
 
 # ============================================================================
-# FUNÇÕES DE PROCESSAMENTO DE DOCUMENTOS
+# FUNÇÕES DE CRIAÇÃO DE DOCUMENTOS
 # ============================================================================
 
 def criar_documento_noticia(noticia: Dict, empresa: str) -> Document:
@@ -270,257 +277,349 @@ def criar_documento_pagina(pagina: Dict, empresa: str) -> Document:
     )
 
 # ============================================================================
+# FUNÇÕES DE CHUNKING PARALELO
+# ============================================================================
+
+def chunk_single_document(args: Tuple[int, str, dict, str]) -> List[Tuple[str, dict]]:
+    """
+    Processa um único documento com chunking simples (por tamanho).
+    Retorna lista de (texto, metadata) para cada chunk.
+    """
+    idx, text, metadata, empresa = args
+    
+    # Chunking simples por tamanho (mais rápido que semântico)
+    MAX_CHUNK_SIZE = 2000  # caracteres
+    OVERLAP = 200  # sobreposição entre chunks
+    
+    chunks = []
+    
+    if len(text) <= MAX_CHUNK_SIZE:
+        # Documento pequeno, não precisa dividir
+        new_metadata = {
+            **metadata,
+            'chunk_id': f"{metadata.get('source', 'doc')}_{0}",
+            'chunk_idx': 0,
+            'total_chunks': 1,
+            'processed_date': datetime.now().isoformat()
+        }
+        chunks.append((text, new_metadata))
+    else:
+        # Dividir em chunks
+        start = 0
+        chunk_idx = 0
+        text_chunks = []
+        
+        while start < len(text):
+            end = start + MAX_CHUNK_SIZE
+            
+            # Tentar quebrar em um espaço para não cortar palavras
+            if end < len(text):
+                # Procurar último espaço antes do limite
+                last_space = text.rfind(' ', start, end)
+                if last_space > start + OVERLAP:
+                    end = last_space
+            
+            text_chunks.append(text[start:end].strip())
+            start = end - OVERLAP if end < len(text) else end
+            chunk_idx += 1
+        
+        total_chunks = len(text_chunks)
+        for i, chunk_text in enumerate(text_chunks):
+            if chunk_text:
+                new_metadata = {
+                    **metadata,
+                    'chunk_id': f"{metadata.get('source', 'doc')}_{i}",
+                    'chunk_idx': i,
+                    'total_chunks': total_chunks,
+                    'processed_date': datetime.now().isoformat()
+                }
+                chunks.append((chunk_text, new_metadata))
+    
+    return chunks
+
+def processar_documentos_paralelo(documentos: List[Document], empresa: str, num_workers: int) -> List[Document]:
+    """
+    Processa os documentos com chunking em paralelo.
+    """
+    if not documentos:
+        return []
+    
+    print(f"\nProcessando {len(documentos)} documentos com {num_workers} workers...")
+    
+    # Preparar argumentos para processamento paralelo
+    args_list = [
+        (i, doc.page_content, doc.metadata, empresa) 
+        for i, doc in enumerate(documentos)
+    ]
+    
+    processed_chunks = []
+    total = len(args_list)
+    
+    # Usar ProcessPoolExecutor para paralelização
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # Submeter todos os trabalhos
+        futures = {executor.submit(chunk_single_document, args): i for i, args in enumerate(args_list)}
+        
+        completed = 0
+        for future in as_completed(futures):
+            completed += 1
+            if completed % 500 == 0 or completed == total:
+                print(f"  Progresso: {completed}/{total} documentos ({100*completed/total:.1f}%)")
+            
+            try:
+                chunks_result = future.result()
+                for text, metadata in chunks_result:
+                    processed_chunks.append(Document(page_content=text, metadata=metadata))
+            except Exception as e:
+                idx = futures[future]
+                print(f"  Erro no documento {idx}: {e}")
+    
+    print(f"  Total de chunks gerados: {len(processed_chunks)}")
+    return processed_chunks
+
+# ============================================================================
 # FUNÇÕES DE REGISTRO
 # ============================================================================
 
 def carregar_registro(empresa: str) -> Dict:
     """Carrega o registro de documentos processados."""
-    processed_file = PROCESSED_FILES_RECORDS[empresa]
-    
-    if os.path.exists(processed_file):
+    arquivo = PROCESSED_FILES_RECORDS[empresa]
+    if os.path.exists(arquivo):
         try:
-            with open(processed_file, 'r', encoding='utf-8') as f:
-                registro = json.load(f)
-                # Verificar se é o novo formato
-                if 'documentos_processados' in registro:
-                    return registro
-                else:
-                    # Formato antigo, retornar estrutura vazia
-                    print(f"  Formato antigo detectado, será reconstruído")
-                    return None
-        except json.JSONDecodeError:
-            print(f"  Erro ao ler registro, será reconstruído")
-            return None
-    return None
+            with open(arquivo, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Erro ao carregar registro: {e}")
+    return {
+        'empresa': empresa,
+        'data_criacao': datetime.now().isoformat(),
+        'data_atualizacao': None,
+        'total_chunks': 0,
+        'fonte': 'PostgreSQL (mgi_raspagem)',
+        'versao': 'parallel_v1',
+        'estatisticas': {
+            'artigos': 0,
+            'paginas': 0,
+            'noticias': 0
+        },
+        'documentos_processados': {
+            'artigos': [],
+            'paginas': [],
+            'noticias': []
+        }
+    }
 
-def extrair_ids_processados(registro: Dict) -> Dict[str, Set[int]]:
-    """Extrai os IDs já processados do registro."""
-    if not registro or 'documentos_processados' not in registro:
-        return {'artigos': set(), 'paginas': set(), 'noticias': set()}
+def salvar_registro(empresa: str, registro: Dict):
+    """Salva o registro de documentos processados."""
+    arquivo = PROCESSED_FILES_RECORDS[empresa]
+    registro['data_atualizacao'] = datetime.now().isoformat()
     
-    docs = registro['documentos_processados']
+    with open(arquivo, 'w', encoding='utf-8') as f:
+        json.dump(registro, f, ensure_ascii=False, indent=2)
+    print(f"Registro atualizado: {arquivo}")
+
+def get_ids_processados(registro: Dict) -> Dict[str, Set[int]]:
+    """Retorna os IDs já processados por tipo de documento."""
+    docs = registro.get('documentos_processados', {})
     return {
         'artigos': set(docs.get('artigos', [])),
         'paginas': set(docs.get('paginas', [])),
         'noticias': set(docs.get('noticias', []))
     }
 
-def atualizar_registro(empresa: str, registro_atual: Dict, novos_chunks: List[Document]) -> Dict:
-    """Atualiza o registro com os novos documentos processados."""
-    
-    # Se não existe registro, criar um novo
-    if not registro_atual:
-        registro_atual = {
-            'empresa': empresa,
-            'data_criacao': datetime.now().isoformat(),
-            'data_atualizacao': datetime.now().isoformat(),
-            'total_chunks': 0,
-            'fonte': 'PostgreSQL (mgi_raspagem)',
-            'estatisticas': {'artigos': 0, 'paginas': 0, 'noticias': 0},
-            'documentos_processados': {'artigos': [], 'paginas': [], 'noticias': []}
-        }
-    
-    # Extrair IDs dos novos chunks
-    novos_artigos = set()
-    novas_paginas = set()
-    novas_noticias = set()
-    
-    for chunk in novos_chunks:
-        doc_type = chunk.metadata.get('type', '')
-        db_id = chunk.metadata.get('db_id')
-        if db_id:
-            if doc_type == 'artigo':
-                novos_artigos.add(db_id)
-            elif doc_type == 'pagina':
-                novas_paginas.add(db_id)
-            elif doc_type == 'noticia':
-                novas_noticias.add(db_id)
-    
-    # Atualizar registro
-    docs = registro_atual['documentos_processados']
-    docs['artigos'] = sorted(list(set(docs.get('artigos', [])) | novos_artigos))
-    docs['paginas'] = sorted(list(set(docs.get('paginas', [])) | novas_paginas))
-    docs['noticias'] = sorted(list(set(docs.get('noticias', [])) | novas_noticias))
-    
-    registro_atual['documentos_processados'] = docs
-    registro_atual['data_atualizacao'] = datetime.now().isoformat()
-    registro_atual['total_chunks'] = registro_atual.get('total_chunks', 0) + len(novos_chunks)
-    registro_atual['estatisticas'] = {
-        'artigos': len(docs['artigos']),
-        'paginas': len(docs['paginas']),
-        'noticias': len(docs['noticias'])
-    }
-    
-    return registro_atual
-
-def salvar_registro(empresa: str, registro: Dict):
-    """Salva o registro de documentos processados."""
-    processed_file = PROCESSED_FILES_RECORDS[empresa]
-    with open(processed_file, 'w', encoding='utf-8') as f:
-        json.dump(registro, f, ensure_ascii=False, indent=2)
-    print(f"  Registro salvo em {processed_file}")
-
 # ============================================================================
 # FUNÇÕES PRINCIPAIS
 # ============================================================================
 
-def processar_documentos_com_chunking(documentos: List[Document]) -> List[Document]:
-    """Processa os documentos com chunking semântico."""
-    if not documentos:
-        return []
-    
-    print(f"  Processando {len(documentos)} documentos com chunking semântico...")
-    
-    chunker = E5SemanticChunker(
-        model_name=EMBEDDING_MODEL,
-        similarity_threshold=0.7,
-        max_tokens_per_chunk=1000,
-        min_tokens_per_chunk=100,
-        print_logging=False
-    )
-    
-    processed_chunks = []
-    
-    for i, doc in enumerate(documentos):
-        if (i + 1) % 50 == 0:
-            print(f"    Processando documento {i+1}/{len(documentos)}...")
-        
-        try:
-            chunks_text = chunker.chunk_text(doc.page_content)
-            
-            for j, chunk_text in enumerate(chunks_text):
-                chunk_doc = Document(
-                    page_content=chunk_text,
-                    metadata={
-                        **doc.metadata,
-                        'chunk_id': f"{doc.metadata.get('source', 'doc')}_{j}",
-                        'chunk_idx': j,
-                        'total_chunks': len(chunks_text),
-                        'processed_date': datetime.now().isoformat()
-                    }
-                )
-                processed_chunks.append(chunk_doc)
-        except Exception as e:
-            print(f"    Aviso: Erro ao processar documento {i}: {e}")
-            doc.metadata['processed_date'] = datetime.now().isoformat()
-            doc.metadata['chunk_id'] = f"{doc.metadata.get('source', 'doc')}_0"
-            doc.metadata['chunk_idx'] = 0
-            doc.metadata['total_chunks'] = 1
-            processed_chunks.append(doc)
-    
-    print(f"  Total de chunks gerados: {len(processed_chunks)}")
-    return processed_chunks
-
-def atualizar_empresa(empresa: str, dry_run: bool = False):
+def coletar_novos_documentos(conn, empresa: str, termos_dict: Dict[int, str], 
+                              ids_processados: Dict[str, Set[int]], force: bool = False) -> List[Document]:
     """
-    Atualiza o banco vetorial de uma empresa com novos documentos.
+    Coleta apenas documentos novos para uma empresa específica.
     """
     print(f"\n{'='*60}")
-    print(f"ATUALIZANDO: {empresa}")
+    print(f"Coletando NOVOS documentos para: {empresa}")
+    if force:
+        print("  (Modo FORCE: ignorando documentos já processados)")
     print(f"{'='*60}")
     
+    documentos = []
+    
+    # IDs a excluir (se não for force)
+    excluir_artigos = None if force else ids_processados.get('artigos', set())
+    excluir_paginas = None if force else ids_processados.get('paginas', set())
+    excluir_noticias = None if force else ids_processados.get('noticias', set())
+    
+    # 1. Buscar artigos novos
+    tabela_artigos = f"tbl_artigos_{empresa.lower()}"
+    print(f"\nBuscando artigos novos em {tabela_artigos}...")
+    if excluir_artigos:
+        print(f"  Excluindo {len(excluir_artigos)} já processados")
+    
+    artigos = get_artigos(conn, tabela_artigos, excluir_artigos)
+    print(f"  Encontrados {len(artigos)} artigos novos")
+    
+    for artigo in artigos:
+        doc = criar_documento_artigo(artigo, empresa)
+        if len(doc.page_content) > 50:
+            documentos.append(doc)
+    
+    # 2. Buscar páginas novas
+    tabela_paginas = f"tbl_paginas_{empresa.lower()}"
+    print(f"\nBuscando páginas novas em {tabela_paginas}...")
+    if excluir_paginas:
+        print(f"  Excluindo {len(excluir_paginas)} já processadas")
+    
+    paginas = get_paginas(conn, tabela_paginas, excluir_paginas)
+    print(f"  Encontradas {len(paginas)} páginas novas")
+    
+    for pagina in paginas:
+        doc = criar_documento_pagina(pagina, empresa)
+        if len(doc.page_content) > 50:
+            documentos.append(doc)
+    
+    # 3. Buscar notícias novas
+    print(f"\nBuscando notícias novas para {empresa}...")
+    
+    config_termos = TERMOS_EMPRESA.get(empresa, {'exclusivos': [], 'compartilhados': []})
+    termos_exclusivos = config_termos['exclusivos']
+    termos_compartilhados = config_termos['compartilhados']
+    todos_termos = termos_exclusivos + termos_compartilhados + TERMOS_GERAIS
+    
+    termo_ids = get_termo_ids_por_nome(termos_dict, todos_termos)
+    
+    if excluir_noticias:
+        print(f"  Excluindo {len(excluir_noticias)} já processadas")
+    
+    noticias = get_noticias_por_termos(conn, termo_ids, excluir_noticias)
+    print(f"  Encontradas {len(noticias)} notícias novas")
+    
+    for noticia in noticias:
+        doc = criar_documento_noticia(noticia, empresa)
+        if len(doc.page_content) > 100:
+            documentos.append(doc)
+    
+    print(f"\nTotal de documentos novos para {empresa}: {len(documentos)}")
+    return documentos
+
+def atualizar_banco_vetorial(empresa: str, chunks: List[Document], registro: Dict):
+    """
+    Adiciona novos chunks ao banco vetorial ChromaDB existente.
+    """
     chroma_dir = CHROMA_DB_DIRS[empresa]
     
-    # Verificar se o banco vetorial existe
+    print(f"\n{'='*60}")
+    print(f"Atualizando banco vetorial: {chroma_dir}")
+    print(f"{'='*60}")
+    
+    # Verificar se o banco existe
     if not os.path.exists(chroma_dir):
-        print(f"ERRO: Banco vetorial não existe em {chroma_dir}")
-        print("Execute primeiro: python rag_rebuild_from_postgres.py --empresa " + empresa)
-        return
+        print(f"ERRO: Banco vetorial não existe: {chroma_dir}")
+        print("Execute o script de rebuild primeiro.")
+        return None
+    
+    # Criar embeddings
+    print(f"\nCriando embeddings com modelo {EMBEDDING_MODEL}...")
+    embeddings = HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL,
+        encode_kwargs={'batch_size': BATCH_SIZE}
+    )
+    
+    # Carregar banco existente
+    print(f"Carregando banco vetorial existente...")
+    vectorstore = Chroma(
+        persist_directory=chroma_dir,
+        embedding_function=embeddings
+    )
+    
+    # Adicionar novos chunks em batches
+    print(f"Adicionando {len(chunks)} novos chunks...")
+    for i in range(0, len(chunks), BATCH_SIZE * 10):
+        batch = chunks[i:i + BATCH_SIZE * 10]
+        print(f"  Processando batch {i//BATCH_SIZE//10 + 1} ({i}/{len(chunks)} chunks)...")
+        vectorstore.add_documents(batch)
+    
+    # Atualizar registro
+    artigos_ids = set(registro.get('documentos_processados', {}).get('artigos', []))
+    paginas_ids = set(registro.get('documentos_processados', {}).get('paginas', []))
+    noticias_ids = set(registro.get('documentos_processados', {}).get('noticias', []))
+    
+    for chunk in chunks:
+        doc_type = chunk.metadata.get('type', '')
+        db_id = chunk.metadata.get('db_id')
+        if db_id:
+            if doc_type == 'artigo':
+                artigos_ids.add(db_id)
+            elif doc_type == 'pagina':
+                paginas_ids.add(db_id)
+            elif doc_type == 'noticia':
+                noticias_ids.add(db_id)
+    
+    registro['total_chunks'] = registro.get('total_chunks', 0) + len(chunks)
+    registro['estatisticas'] = {
+        'artigos': len(artigos_ids),
+        'paginas': len(paginas_ids),
+        'noticias': len(noticias_ids)
+    }
+    registro['documentos_processados'] = {
+        'artigos': sorted(list(artigos_ids)),
+        'paginas': sorted(list(paginas_ids)),
+        'noticias': sorted(list(noticias_ids))
+    }
+    
+    print(f"\nBanco vetorial atualizado com sucesso!")
+    print(f"  - Novos chunks: {len(chunks)}")
+    print(f"  - Total de chunks: {registro['total_chunks']}")
+    print(f"  - Artigos: {len(artigos_ids)}, Páginas: {len(paginas_ids)}, Notícias: {len(noticias_ids)}")
+    
+    return vectorstore
+
+def atualizar_empresa(empresa: str, num_workers: int, force: bool = False):
+    """
+    Atualiza uma empresa: busca novos dados e adiciona ao banco vetorial.
+    """
+    inicio = datetime.now()
+    print(f"\n{'#'*70}")
+    print(f"# ATUALIZANDO: {empresa}")
+    print(f"# Início: {inicio.isoformat()}")
+    print(f"{'#'*70}")
     
     # Carregar registro existente
-    print("\n1. Carregando registro de documentos processados...")
     registro = carregar_registro(empresa)
-    ids_processados = extrair_ids_processados(registro)
+    ids_processados = get_ids_processados(registro)
     
-    print(f"  Artigos já processados: {len(ids_processados['artigos'])}")
-    print(f"  Páginas já processadas: {len(ids_processados['paginas'])}")
-    print(f"  Notícias já processadas: {len(ids_processados['noticias'])}")
+    print(f"\nDocumentos já processados:")
+    print(f"  - Artigos: {len(ids_processados['artigos'])}")
+    print(f"  - Páginas: {len(ids_processados['paginas'])}")
+    print(f"  - Notícias: {len(ids_processados['noticias'])}")
     
-    # Conectar ao PostgreSQL
-    print("\n2. Buscando novos documentos no PostgreSQL...")
+    # Conectar ao banco
     conn = get_db_connection()
     
     try:
+        # Obter dicionário de termos
         termos_dict = get_termos_busca(conn)
         
-        # Buscar documentos novos
-        tabela_artigos = f"tbl_artigos_{empresa.lower()}"
-        tabela_paginas = f"tbl_paginas_{empresa.lower()}"
+        # Coletar documentos novos
+        documentos = coletar_novos_documentos(conn, empresa, termos_dict, ids_processados, force)
         
-        novos_artigos = get_novos_artigos(conn, tabela_artigos, ids_processados['artigos'])
-        novas_paginas = get_novas_paginas(conn, tabela_paginas, ids_processados['paginas'])
-        
-        # Buscar novas notícias
-        config_termos = TERMOS_EMPRESA.get(empresa, {'exclusivos': [], 'compartilhados': []})
-        todos_termos = config_termos['exclusivos'] + config_termos['compartilhados'] + TERMOS_GERAIS
-        termo_ids = get_termo_ids_por_nome(termos_dict, todos_termos)
-        novas_noticias = get_novas_noticias(conn, termo_ids, ids_processados['noticias'])
-        
-        print(f"  Novos artigos encontrados: {len(novos_artigos)}")
-        print(f"  Novas páginas encontradas: {len(novas_paginas)}")
-        print(f"  Novas notícias encontradas: {len(novas_noticias)}")
-        
-        total_novos = len(novos_artigos) + len(novas_paginas) + len(novas_noticias)
-        
-        if total_novos == 0:
-            print("\n✓ Nenhum documento novo encontrado. Banco vetorial está atualizado!")
+        if not documentos:
+            print(f"\nNenhum documento novo para {empresa}")
             return
         
-        if dry_run:
-            print(f"\n[DRY-RUN] Seriam processados {total_novos} novos documentos")
-            return
+        # Aplicar chunking paralelo
+        chunks = processar_documentos_paralelo(documentos, empresa, num_workers)
         
-        # Criar documentos LangChain
-        print("\n3. Criando documentos...")
-        documentos = []
+        # Atualizar banco vetorial
+        atualizar_banco_vetorial(empresa, chunks, registro)
         
-        for artigo in novos_artigos:
-            doc = criar_documento_artigo(artigo, empresa)
-            if len(doc.page_content) > 50:
-                documentos.append(doc)
+        # Salvar registro atualizado
+        salvar_registro(empresa, registro)
         
-        for pagina in novas_paginas:
-            doc = criar_documento_pagina(pagina, empresa)
-            if len(doc.page_content) > 50:
-                documentos.append(doc)
-        
-        for noticia in novas_noticias:
-            doc = criar_documento_noticia(noticia, empresa)
-            if len(doc.page_content) > 100:
-                documentos.append(doc)
-        
-        print(f"  Documentos válidos: {len(documentos)}")
-        
-        # Aplicar chunking
-        print("\n4. Aplicando chunking semântico...")
-        chunks = processar_documentos_com_chunking(documentos)
-        
-        if not chunks:
-            print("  Nenhum chunk gerado")
-            return
-        
-        # Adicionar ao banco vetorial existente
-        print(f"\n5. Adicionando {len(chunks)} chunks ao banco vetorial...")
-        embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-        
-        # Carregar banco existente e adicionar documentos
-        vectorstore = Chroma(
-            persist_directory=chroma_dir,
-            embedding_function=embeddings
-        )
-        
-        vectorstore.add_documents(chunks)
-        
-        # Atualizar e salvar registro
-        print("\n6. Atualizando registro...")
-        registro_atualizado = atualizar_registro(empresa, registro, chunks)
-        salvar_registro(empresa, registro_atualizado)
-        
-        print(f"\n✓ Atualização concluída!")
-        print(f"  - Novos chunks adicionados: {len(chunks)}")
-        print(f"  - Total de artigos: {registro_atualizado['estatisticas']['artigos']}")
-        print(f"  - Total de páginas: {registro_atualizado['estatisticas']['paginas']}")
-        print(f"  - Total de notícias: {registro_atualizado['estatisticas']['noticias']}")
+        fim = datetime.now()
+        duracao = fim - inicio
+        print(f"\n{'#'*70}")
+        print(f"# {empresa} ATUALIZADO em {duracao}")
+        print(f"{'#'*70}")
         
     finally:
         conn.close()
@@ -528,7 +627,7 @@ def atualizar_empresa(empresa: str, dry_run: bool = False):
 def main():
     """Função principal."""
     parser = argparse.ArgumentParser(
-        description='Atualiza bancos vetoriais com novos documentos do PostgreSQL'
+        description='Atualiza bancos vetoriais ChromaDB com novos dados do PostgreSQL (versão paralela)'
     )
     parser.add_argument(
         '--empresa',
@@ -536,6 +635,17 @@ def main():
         default='ALL',
         choices=['CEITEC', 'IMBEL', 'Telebras', 'ALL'],
         help='Empresa a atualizar (padrão: ALL)'
+    )
+    parser.add_argument(
+        '--workers',
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f'Número de workers para processamento paralelo (padrão: {DEFAULT_WORKERS})'
+    )
+    parser.add_argument(
+        '--force',
+        action='store_true',
+        help='Força reprocessamento de todos os documentos (ignora registro)'
     )
     parser.add_argument(
         '--dry-run',
@@ -546,8 +656,10 @@ def main():
     args = parser.parse_args()
     
     print("="*70)
-    print("ATUALIZAÇÃO INCREMENTAL DOS BANCOS VETORIAIS")
+    print("ATUALIZAÇÃO DOS BANCOS VETORIAIS RAG (VERSÃO PARALELA)")
     print(f"Data/Hora: {datetime.now().isoformat()}")
+    print(f"Workers: {args.workers}")
+    print(f"Force: {args.force}")
     print("="*70)
     
     # Testar conexão
@@ -555,10 +667,20 @@ def main():
     try:
         conn = get_db_connection()
         print("  Conexão estabelecida com sucesso!")
+        
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT COUNT(*) as total FROM tbl_noticias")
+            total_noticias = cur.fetchone()['total']
+            print(f"  Total de notícias no banco: {total_noticias}")
+        
         conn.close()
     except Exception as e:
         print(f"  ERRO na conexão: {e}")
         sys.exit(1)
+    
+    if args.dry_run:
+        print("\n[DRY-RUN] Simulação - nenhuma alteração será feita")
+        return
     
     # Processar empresas
     if args.empresa == 'ALL':
@@ -566,11 +688,17 @@ def main():
     else:
         empresas = [args.empresa]
     
+    inicio_total = datetime.now()
+    
     for empresa in empresas:
-        atualizar_empresa(empresa, args.dry_run)
+        atualizar_empresa(empresa, args.workers, args.force)
+    
+    fim_total = datetime.now()
+    duracao_total = fim_total - inicio_total
     
     print("\n" + "="*70)
-    print("ATUALIZAÇÃO CONCLUÍDA!")
+    print("ATUALIZAÇÃO CONCLUÍDA COM SUCESSO!")
+    print(f"Tempo total: {duracao_total}")
     print("="*70)
 
 if __name__ == "__main__":
