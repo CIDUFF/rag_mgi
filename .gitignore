@@ -4,34 +4,31 @@ __pycache__/
 build/
 dist/
 wheels/
-data/
 *.egg-info
-chroma_db_semantic/
 *.pickle
-*.sqlite3
 *.bin
 
-# RAG secundário
-# rag_2/
-# api_2/
-# chat_2/
-MCP-materiais/
+# Bancos vetoriais ChromaDB (gerados)
 chroma_db_semantic_CEITEC/
 chroma_db_semantic_IMBEL/
 chroma_db_semantic_Telebras/
-test_telebras_client.py
+*.sqlite3
 
-# Temporary files and directories
+# Arquivos de registro de processamento
 processed_files.json
 processed_files_CEITEC.json
 processed_files_IMBEL.json
 processed_files_Telebras.json
 
-# Virtual environments
+# Virtual environments e configurações locais
 .venv
 .env
-nohup.out
-log
-chat.pid
-api.pid
 uv.lock
+
+# Logs e arquivos temporários
+logs/*.log
+nohup.out
+*.log
+
+# Testes
+mcp-client/test_*.py

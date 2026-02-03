@@ -1,1 +1,20 @@
-{}
+{
+    "dbcode.connections": [
+        {
+            "connectionId": "cHRsw5pL6iPXaaV3NuGCC",
+            "name": "mgi_raspagem",
+            "driver": "postgres",
+            "connectionType": "host",
+            "host": "localhost",
+            "port": 5432,
+            "ssl": false,
+            "username": "leocamilo",
+            "password": "",
+            "savePassword": "secretStorage",
+            "database": "mgi_raspagem",
+            "readOnly": false,
+            "postConnectionSqlType": "inline",
+            "connectionTimeout": 30
+        }
+    ]
+}

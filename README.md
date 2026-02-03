@@ -1,53 +1,84 @@
 # RAG MGI - Sistema de Consulta a Documentos
 
-Sistema de consulta baseado em RAG (Retrieval-Augmented Generation) para documentos do MGI, utilizando LLM DeepSeek e embeddings locais.
+Sistema de consulta baseado em RAG (Retrieval-Augmented Generation) para análise de empresas estatais (CEITEC, IMBEL, Telebras), utilizando LLM DeepSeek, embeddings locais e arquitetura MCP (Model Context Protocol).
+
+## Arquitetura
+
+O sistema utiliza uma arquitetura baseada em MCP (Model Context Protocol) onde:
+- Cada empresa possui seu próprio servidor MCP com base vetorial dedicada
+- Um cliente MCP unifica as consultas aos diferentes servidores
+- Os dados são extraídos do banco PostgreSQL (`mgi_raspagem`)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      MCP Client                              │
+│                   (mcp-client/)                              │
+└─────────────────────┬───────────────────────────────────────┘
+                      │
+        ┌─────────────┼─────────────┐
+        ▼             ▼             ▼
+┌───────────┐  ┌───────────┐  ┌───────────┐
+│MCP CEITEC │  │MCP IMBEL  │  │MCP Telebras│
+│(mcp-serv.)│  │(mcp-serv.)│  │(mcp-serv.) │
+└─────┬─────┘  └─────┬─────┘  └─────┬─────┘
+      │              │              │
+      ▼              ▼              ▼
+┌───────────┐  ┌───────────┐  ┌───────────┐
+│ChromaDB   │  │ChromaDB   │  │ChromaDB   │
+│CEITEC     │  │IMBEL      │  │Telebras   │
+└───────────┘  └───────────┘  └───────────┘
+```
 
 ## Tecnologias Utilizadas
 
 ### Core
 - Python 3.12+
-- FastAPI - Framework web para API
-- Gradio - Interface de chat
 - LangChain - Framework para LLM
 - DeepSeek - Modelo de linguagem
-- Sentence Transformers - Embeddings locais
+- Sentence Transformers (E5 Multilingual) - Embeddings locais
 - ChromaDB - Banco de dados vetorial
+- PostgreSQL - Banco de dados fonte (mgi_raspagem)
+- MCP (Model Context Protocol) - Protocolo de comunicação
 
 ### Dependências Principais
 - langchain-deepseek: Integração com modelo DeepSeek
 - langchain-community: Componentes comunitários do LangChain
-- sentence-transformers/all-MiniLM-L6-v2: Modelo de embeddings
+- sentence-transformers/multilingual-e5-large: Modelo de embeddings
 - chromadb: Armazenamento vetorial
-- FastAPI: API REST
-- Gradio: Interface web
-- uvicorn: Servidor ASGI
+- psycopg2-binary: Driver PostgreSQL
+- mcp: Model Context Protocol
 
 ## Estrutura do Projeto
-```
-rag_mgi/ 
-├── api/
-│   └── rag_api.py # API REST (FastAPI)
-├── chat/
-│   └── chat.py # Interface de chat (Gradio)
-├── processing/
-│   ├── agentic_chunker.py # Chunking semântico (Opcional)
-│   └── conversao.py # Conversor de documentos (PDF/DOCX -> MD)
-├── rag/
-│   └── rag_pergunta_resposta.py # Lógica RAG principal (Não usado pela API/Chat atualmente)
-├── data/ # Diretório padrão para documentos Markdown processados (verificar código)
-├── data2/ # Diretório alternativo usado em alguns scripts (verificar código)
-│   ├── raw/ # Dados brutos para conversão
-│   └── processed/ # Dados convertidos para MD
-├── chroma_db/ # Base de dados vetorial (gerada)
-├── logs/ # Logs da API e do Chat (gerados)
-├── .env # Arquivo para variáveis de ambiente (API Keys, etc.)
-├── requirements.txt # Dependências Python (pip)
-├── pyproject.toml # Configuração do projeto e dependências (uv/pip)
-├── run_api.sh # Script para iniciar a API em background
-├── run_chat.sh # Script para iniciar o Chat em background
-├── stop_services.sh # Script para parar os serviços em background
-└── README.md # Este arquivo
 
+```
+rag_mgi/
+├── mcp-servidores/              # Servidores MCP por empresa
+│   ├── mcp_CEITEC.py            # Servidor MCP para CEITEC
+│   ├── mcp_IMBEL.py             # Servidor MCP para IMBEL
+│   └── mcp_Telebras.py          # Servidor MCP para Telebras
+├── mcp-client/                  # Cliente MCP unificado
+│   ├── mcp_client.py            # Cliente que conecta aos servidores
+│   └── test_telebras_client.py  # Testes do cliente
+├── rag_2/                       # Lógica RAG por empresa
+│   ├── rag_cria_bd_CEITEC.py    # Criação do banco vetorial CEITEC
+│   ├── rag_cria_bd_IMBEL.py     # Criação do banco vetorial IMBEL
+│   ├── rag_cria_bd_Telebras.py  # Criação do banco vetorial Telebras
+│   ├── rag_rebuild_from_postgres.py  # Reconstrução a partir do PostgreSQL
+│   ├── update_vectordb_CEITEC.py
+│   ├── update_vectordb_IMBEL.py
+│   └── update_vectordb_Telebras.py
+├── processing/                  # Processamento de documentos
+│   ├── agentic_chunker.py       # Chunking baseado em agente
+│   ├── semantic_chunker.py      # Chunker semântico E5
+│   └── conversao.py             # Conversor PDF/DOCX -> MD
+├── chroma_db_semantic_CEITEC/   # Base vetorial CEITEC (gerada)
+├── chroma_db_semantic_IMBEL/    # Base vetorial IMBEL (gerada)
+├── chroma_db_semantic_Telebras/ # Base vetorial Telebras (gerada)
+├── logs/                        # Logs dos serviços
+├── .env                         # Variáveis de ambiente
+├── pyproject.toml               # Configuração do projeto
+├── requirements.txt             # Dependências Python
+└── README.md                    # Este arquivo
 ```
 
 ## Configuração
@@ -55,9 +86,7 @@ rag_mgi/
 1. Crie um ambiente virtual:
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # Linux/Mac
-# ou
-.venv\Scripts\activate     # Windows
+source .venv/bin/activate
 ```
 
 2. Instale as dependências:
@@ -73,92 +102,66 @@ cp .env.example .env
 # Edite .env e adicione sua DEEPSEEK_API_KEY
 ```
 
-4. Prepare seus documentos:
-- Coloque seus arquivos Markdown na pasta `data/`
-- Os documentos devem estar no formato `.md`
+## Banco de Dados PostgreSQL
+
+O sistema utiliza o banco `mgi_raspagem` com as seguintes tabelas:
+
+### Por Empresa
+- `tbl_artigos_{empresa}`: Artigos científicos
+- `tbl_paginas_{empresa}`: Páginas web raspadas
+
+### Notícias
+- `tbl_noticias`: Todas as notícias coletadas
+- `tbl_termos_busca`: Termos de busca utilizados
+- `tbl_resultados_busca`: Relacionamento termo → notícia
 
 ## Executando o Sistema
 
-### Método 1: Execução em Background (Recomendado)
+### 1. Reconstruir Bancos Vetoriais (a partir do PostgreSQL)
 
-1. Dê permissão aos scripts:
 ```bash
-chmod +x run_api.sh run_chat.sh stop_services.sh
+# Reconstruir todos
+python rag_2/rag_rebuild_from_postgres.py
+
+# Reconstruir apenas uma empresa
+python rag_2/rag_rebuild_from_postgres.py --empresa CEITEC
+python rag_2/rag_rebuild_from_postgres.py --empresa IMBEL
+python rag_2/rag_rebuild_from_postgres.py --empresa Telebras
+
+# Modo dry-run (apenas mostra o que seria feito)
+python rag_2/rag_rebuild_from_postgres.py --dry-run
 ```
 
-2. Inicie os serviços:
+### 2. Iniciar Servidores MCP
+
 ```bash
-./run_api.sh    # Inicia API na porta 8000
-./run_chat.sh   # Inicia chat na porta 8520
+# Em terminais separados:
+python mcp-servidores/mcp_CEITEC.py
+python mcp-servidores/mcp_IMBEL.py
+python mcp-servidores/mcp_Telebras.py
 ```
 
-3. Monitore os logs:
+### 3. Usar o Cliente MCP
+
 ```bash
-tail -f logs/api.log    # Logs da API
-tail -f logs/chat.log   # Logs do chat
+python mcp-client/mcp_client.py
 ```
 
-4. Para parar os serviços:
-```bash
-./stop_services.sh
+## Fluxo de Dados
+
+1. **Coleta**: Dados são coletados e armazenados no PostgreSQL (`mgi_raspagem`)
+2. **Extração**: Script `rag_rebuild_from_postgres.py` extrai dados do PostgreSQL
+3. **Processamento**: Chunking semântico com modelo E5 multilingual
+4. **Indexação**: Criação de embeddings e armazenamento no ChromaDB
+5. **Consulta**: Servidores MCP respondem consultas usando RAG
+6. **Unificação**: Cliente MCP agrega resultados dos diferentes servidores
+
+## Variáveis de Ambiente
+
+```env
+DEEPSEEK_API_KEY=sua_chave_aqui
 ```
-
-### Método 2: Execução Manual
-
-1. Inicie a API (Terminal 1):
-```bash
-uv run api/rag_api.py
-```
-
-2. Inicie o chat (Terminal 2):
-```bash
-uv run chat/chat.py
-```
-
-## Acessando o Sistema
-
-- API RAG: http://localhost:8000
-  - Documentação: http://localhost:8000/docs
-  - Endpoint principal: http://localhost:8000/query
-
-- Interface Chat: http://localhost:8520
-  - Chat DeepSeek: Aba 1
-  - Chat RAG: Aba 2
-
-## Capacidades do Sistema
-
-1. Chat DeepSeek
-- Responde em português do Brasil
-- Mantém contexto da conversa
-- Temperatura 0.7 para respostas criativas
-
-2. Chat RAG
-- Consulta documentos locais
-- Retorna fontes das informações
-- Embeddings locais para privacidade
-- Respostas baseadas em contexto
-
-## Troubleshooting
-
-1. Portas em uso:
-- API: tenta porta 8000
-- Chat: tenta portas 8520-8524
-
-2. Logs:
-- API: `logs/api.log`
-- Chat: `logs/chat.log`
-
-3. Problemas comuns:
-- "DEEPSEEK_API_KEY não encontrada": Configure no .env
-- "Directory not found": Crie pasta data/
-- "Porta em uso": Use GRADIO_SERVER_PORT=<porta> ou aguarde porta alternativa
-
-## Limitações
-
-- Aceita apenas arquivos Markdown (.md)
-- Requer chave API DeepSeek válida
-- Embeddings podem consumir memória significativa
 
 ## Licença
 
-MIT License
+MIT
