@@ -48,13 +48,22 @@ load_dotenv()
 # ============================================================================
 
 # Configurações do banco de dados PostgreSQL
+# Configurações do banco de dados PostgreSQL (via variáveis de ambiente)
 DB_CONFIG = {
-    'host': 'localhost',
-    'port': 5432,
-    'database': 'mgi_raspagem',
-    'user': 'leocamilo',
-    'password': 'leocamilo'
+    'host': os.getenv('DB_HOST', 'localhost'),
+    'port': int(os.getenv('DB_PORT', 5432)),
+    'database': os.getenv('DB_NAME', 'mgi_raspagem'),
+    'user': os.getenv('DB_USER'),
+    'password': os.getenv('DB_PASSWORD')
 }
+
+# Validar configurações do banco
+if not DB_CONFIG['user'] or not DB_CONFIG['password']:
+    print("ERRO: Variáveis de ambiente DB_USER e DB_PASSWORD são obrigatórias.")
+    print("Configure no arquivo .env:")
+    print("  DB_USER=seu_usuario")
+    print("  DB_PASSWORD=sua_senha")
+    sys.exit(1)
 
 # Configurações dos bancos vetoriais
 CHROMA_DB_DIRS = {
