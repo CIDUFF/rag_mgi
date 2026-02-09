@@ -75,8 +75,9 @@ PROCESSED_FILES_RECORDS = {
     'Telebras': './processed_files_Telebras.json'
 }
 
-# Modelo de embeddings
-EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
+# Modelo de embeddings (versão leve e rápida, multilingual)
+# Alternativas: "intfloat/multilingual-e5-large" (mais preciso, muito lento)
+EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 # Configurações de paralelização
 DEFAULT_WORKERS = min(mp.cpu_count(), 8)  # Limitar a 8 workers
@@ -181,6 +182,14 @@ def get_paginas(conn, tabela: str) -> List[Dict]:
 # FUNÇÕES DE CRIAÇÃO DE DOCUMENTOS
 # ============================================================================
 
+def sanitize_metadata(value, default=''):
+    """Sanitiza valor de metadado para ChromaDB (não aceita None)."""
+    if value is None:
+        return default
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
 def criar_documento_noticia(noticia: Dict, empresa: str) -> Document:
     """Cria um Document LangChain a partir de uma notícia."""
     partes = []
@@ -199,10 +208,10 @@ def criar_documento_noticia(noticia: Dict, empresa: str) -> Document:
             'source': f"noticia_{noticia['id']}",
             'type': 'noticia',
             'empresa': empresa,
-            'title': noticia.get('title', ''),
-            'link': noticia.get('link', ''),
-            'published': str(noticia.get('published', '')),
-            'publisher': noticia.get('publisher_name', ''),
+            'title': sanitize_metadata(noticia.get('title')),
+            'link': sanitize_metadata(noticia.get('link')),
+            'published': sanitize_metadata(noticia.get('published')),
+            'publisher': sanitize_metadata(noticia.get('publisher_name')),
             'db_id': noticia['id']
         }
     )
@@ -229,10 +238,10 @@ def criar_documento_artigo(artigo: Dict, empresa: str) -> Document:
             'source': f"artigo_{artigo['id']}",
             'type': 'artigo',
             'empresa': empresa,
-            'title': artigo.get('titulo', ''),
-            'ano': artigo.get('ano', ''),
-            'autores': artigo.get('autores', ''),
-            'doi': artigo.get('doi', ''),
+            'title': sanitize_metadata(artigo.get('titulo')),
+            'ano': sanitize_metadata(artigo.get('ano')),
+            'autores': sanitize_metadata(artigo.get('autores')),
+            'doi': sanitize_metadata(artigo.get('doi')),
             'db_id': artigo['id']
         }
     )
@@ -253,8 +262,8 @@ def criar_documento_pagina(pagina: Dict, empresa: str) -> Document:
             'source': f"pagina_{pagina['id']}",
             'type': 'pagina',
             'empresa': empresa,
-            'link': pagina.get('link', ''),
-            'dt_download': str(pagina.get('dt_download', '')),
+            'link': sanitize_metadata(pagina.get('link')),
+            'dt_download': sanitize_metadata(pagina.get('dt_download')),
             'db_id': pagina['id']
         }
     )
