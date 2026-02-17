@@ -845,6 +845,9 @@ async def check_server_availability(name: str, url: str) -> tuple[bool, list[str
 
 def setup_and_launch_gradio():
     with gr.Blocks(title="Chat RAG MGI", theme=gr.themes.Soft(), css="""
+        * {
+            font-family: Arial, Helvetica, sans-serif !important;
+        }
         .user-header { 
             display: flex; 
             justify-content: space-between; 
