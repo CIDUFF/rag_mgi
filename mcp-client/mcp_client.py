@@ -1105,7 +1105,7 @@ def setup_and_launch_gradio():
             logger.error(f"Erro ao usar porta {port_to_use} da variável de ambiente: {e_launch}", exc_info=True)
             raise # Relança se a porta especificada falhar
             
-    ports_to_try = [8520, 8525, 8530, 7860, 7861] # Lista de portas comuns para Gradio
+    ports_to_try = [8521, 8522, 8523, 7860, 7861] # Lista de portas para DEVELOP (8520 reservada para produção)
     logger.info(f"Tentando portas para o servidor Gradio: {ports_to_try}")
     for port_val in ports_to_try:
         try:
