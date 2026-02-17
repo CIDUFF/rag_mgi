@@ -34,21 +34,25 @@ from langchain_core.messages import SystemMessage, HumanMessage # Para formatar 
 # Variáveis de ambiente
 load_dotenv()
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 # Configuração LLM via .env (cliente usa síntese, pode ser diferente dos servidores)
-LLM_CALL = os.getenv("LLM_CALL_CLIENT", "API")  # "API" ou "Ollama"
+# Opções: "API" (DeepSeek), "Ollama", "Anthropic"
+LLM_CALL = os.getenv("LLM_CALL_CLIENT", "API")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:30b")
 
 def strip_think_tags(text: str) -> str:
-    """Remove blocos  comprehendidos de modelos reasoning (ex: Qwen3, DeepSeek-R1)."""
-    return re.sub(r' comprehendidos\s*', '', text, flags=re.DOTALL).strip()
+    """Remove blocos <think>...</think> de modelos reasoning (ex: Qwen3, DeepSeek-R1)."""
+    return re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
 
 if LLM_CALL == "API" and not DEEPSEEK_API_KEY:
     logger.error("DEEPSEEK_API_KEY não encontrada e LLM_CALL='API'. Verifique o arquivo .env")
-    # Considerar sair ou definir um fallback se a API for essencial e a chave estiver faltando
-    # sys.exit(1) 
+elif LLM_CALL == "Anthropic" and not ANTHROPIC_API_KEY:
+    logger.error("ANTHROPIC_API_KEY não encontrada e LLM_CALL='Anthropic'. Verifique o arquivo .env")
 elif LLM_CALL == "Ollama":
-    logger.info("LLM_CALL configurado para 'Ollama'. A chave DEEPSEEK_API_KEY não será usada para a síntese principal.")
+    logger.info("LLM_CALL configurado para 'Ollama'.")
+elif LLM_CALL == "Anthropic":
+    logger.info("LLM_CALL configurado para 'Anthropic' (Claude).")
 
 # Cliente OpenAI para DeepSeek (será usado se LLM_CALL == "API")
 openai_client = None
@@ -59,6 +63,18 @@ if LLM_CALL == "API" and DEEPSEEK_API_KEY:
     )
 elif LLM_CALL == "API" and not DEEPSEEK_API_KEY:
     logger.warning("LLM_CALL é 'API', mas DEEPSEEK_API_KEY não está definida. A síntese via API falhará.")
+
+# Cliente Anthropic (será usado se LLM_CALL == "Anthropic")
+anthropic_client = None
+if LLM_CALL == "Anthropic" and ANTHROPIC_API_KEY:
+    try:
+        import anthropic
+        anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        logger.info("Cliente Anthropic inicializado com sucesso.")
+    except ImportError:
+        logger.error("Biblioteca 'anthropic' não instalada. Execute: pip install anthropic")
+elif LLM_CALL == "Anthropic" and not ANTHROPIC_API_KEY:
+    logger.warning("LLM_CALL é 'Anthropic', mas ANTHROPIC_API_KEY não está definida.")
 
 
 # Configurações dos servidores MCP
@@ -280,7 +296,15 @@ Formato do resumo:
     # Gerar resumo usando a LLM
     compacted_summary = ""
     try:
-        if LLM_CALL == "API" and openai_client:
+        if LLM_CALL == "Anthropic" and anthropic_client:
+            response = anthropic_client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=500,
+                system="Você é um assistente que faz resumos concisos de conversas.",
+                messages=[{"role": "user", "content": summary_prompt}]
+            )
+            compacted_summary = response.content[0].text
+        elif LLM_CALL == "API" and openai_client:
             response = openai_client.chat.completions.create(
                 model="deepseek-chat",
                 messages=[
@@ -679,7 +703,28 @@ As sugestões devem ser ESPECÍFICAS e CONTEXTUAIS ao que foi perguntado e respo
     api_messages.append({"role": "user", "content": user_prompt_content})
 
     try:
-        if LLM_CALL == "API":
+        if LLM_CALL == "Anthropic":
+            if not anthropic_client:
+                raise ValueError("Cliente Anthropic não inicializado. Verifique ANTHROPIC_API_KEY.")
+            logger.info(f"Enviando para síntese LLM via Anthropic (Claude) com {len(api_messages)} mensagens...")
+            # Separar system message das demais para API Anthropic
+            system_content = ""
+            anthropic_messages = []
+            for msg in api_messages:
+                if msg["role"] == "system":
+                    system_content += msg["content"] + "\n"
+                else:
+                    anthropic_messages.append({"role": msg["role"], "content": msg["content"]})
+            
+            api_response = anthropic_client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=6000,
+                system=system_content.strip(),
+                messages=anthropic_messages
+            )
+            synthesized_answer = api_response.content[0].text
+        
+        elif LLM_CALL == "API":
             if not openai_client:
                 raise ValueError("Cliente OpenAI (DeepSeek API) não inicializado. Verifique DEEPSEEK_API_KEY.")
             logger.info(f"Enviando para síntese LLM via API (DeepSeek) com {len(api_messages)} mensagens...")

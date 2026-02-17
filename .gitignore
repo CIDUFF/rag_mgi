@@ -24,6 +24,7 @@ processed_files_Telebras.json
 .venv
 .env
 uv.lock
+.vscode/
 
 # Logs e arquivos temporários
 logs/*.log

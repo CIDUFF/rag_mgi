@@ -30,4 +30,5 @@ dependencies = [
     "fastmcp>=2.3.3",
     "mcp>=1.8.1",
     "psycopg2-binary>=2.9.11",
+    "langchain-anthropic>=0.3.22",
 ]

@@ -20,6 +20,7 @@ from langchain_community.vectorstores import Chroma
 from langchain.prompts import PromptTemplate
 from langchain_deepseek import ChatDeepSeek
 from langchain_community.chat_models import ChatOllama
+from langchain_anthropic import ChatAnthropic
 from langchain.chains import RetrievalQA
 from contextlib import asynccontextmanager
 
@@ -41,8 +42,9 @@ CHROMA_DB_DIR_IMBEL = "./chroma_db_semantic_IMBEL"
 PROCESSED_FILES_RECORD = "./processed_files_IMBEL.json"
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 INITIAL_RETRIEVAL_K = 30  # Recuperação inicial mais ampla
-LLM_CALL = os.getenv("LLM_CALL_SERVER", "Ollama")  # "API" ou "Ollama" — configurável via .env
+LLM_CALL = os.getenv("LLM_CALL_SERVER", "Ollama")  # "API", "Ollama" ou "Anthropic" — configurável via .env
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:30b")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 def strip_think_tags(text: str) -> str:
     """Remove blocos <think>...</think> de modelos reasoning (ex: Qwen3, DeepSeek-R1)."""
@@ -156,6 +158,9 @@ def initialize_rag_chain(vectorstore):
     elif LLM_CALL == "Ollama":
         print("Usando LLM via Ollama: deepseek-llm para IMBEL")
         llm = ChatOllama(model=OLLAMA_MODEL, temperature=1.0, top_k=40, top_p=0.9, num_ctx=4096)
+    elif LLM_CALL == "Anthropic":
+        print("Usando LLM via Anthropic: Claude para IMBEL")
+        llm = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=1.0, max_tokens=6000, api_key=ANTHROPIC_API_KEY)
     else:
         print(f"AVISO (IMBEL): Valor de LLM_CALL ('{LLM_CALL}') não reconhecido. Usando ChatDeepSeek por padrão.")
         llm = ChatDeepSeek(model="deepseek-chat", temperature=1.0, max_tokens=6000, timeout=None, max_retries=3)
