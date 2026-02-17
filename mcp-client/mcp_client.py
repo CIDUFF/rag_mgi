@@ -125,13 +125,31 @@ def get_user_display_name(username: str) -> str:
         return AUTH_USERS[username].get("nome", username)
     return username
 
-def save_chat_history(username: str, history: list):
-    """Salva o histórico de chat do usuário em arquivo JSON."""
+def save_chat_history(username: str, history: list, session_file: str | None = None) -> str:
+    """
+    Salva o histórico de chat do usuário em arquivo JSON.
+    
+    Args:
+        username: Nome do usuário
+        history: Lista de mensagens do chat
+        session_file: Nome do arquivo de sessão existente (opcional).
+                      Se None, cria um novo arquivo.
+    
+    Returns:
+        Nome do arquivo usado para salvar (para rastreamento da sessão)
+    """
     try:
         user_dir = CHAT_HISTORY_DIR / username
         user_dir.mkdir(exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filepath = user_dir / f"chat_{timestamp}.json"
+        
+        # Se temos um arquivo de sessão existente, usa ele; senão, cria um novo
+        if session_file:
+            filepath = user_dir / session_file
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            session_file = f"chat_{timestamp}.json"
+            filepath = user_dir / session_file
+        
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump({
                 "username": username,
@@ -139,8 +157,10 @@ def save_chat_history(username: str, history: list):
                 "messages": history
             }, f, ensure_ascii=False, indent=2)
         logger.info(f"Histórico salvo: {filepath}")
+        return session_file
     except Exception as e:
         logger.error(f"Erro ao salvar histórico de {username}: {e}")
+        return session_file or ""
 
 def load_chat_sessions(username: str) -> list:
     """Carrega lista de sessões de chat do usuário."""
@@ -993,6 +1013,9 @@ def setup_and_launch_gradio():
                     )
                     rename_btn = gr.Button("✏️", size="sm", scale=1)
         
+        # State para rastrear o arquivo da sessão atual
+        current_session_file = gr.State(value=None)
+        
         # Exibir nome do usuário logado no header
         def show_user_info(request: gr.Request):
             if request and request.username:
@@ -1014,20 +1037,21 @@ def setup_and_launch_gradio():
         
         # Novo chat
         def new_chat():
-            return [], "", 0, "🟢 0% - Conversa iniciada"
+            # Retorna None para session_file, indicando que é uma nova conversa
+            return [], "", 0, "🟢 0% - Conversa iniciada", None
         
-        new_chat_btn.click(new_chat, outputs=[chatbot, query_input, token_progress, token_status])
+        new_chat_btn.click(new_chat, outputs=[chatbot, query_input, token_progress, token_status, current_session_file])
         
         # Salvar chat
-        def save_current_chat(history: list, request: gr.Request):
+        def save_current_chat(history: list, session_file: str, request: gr.Request):
             if request and request.username and history:
-                save_chat_history(request.username, history)
+                new_session_file = save_chat_history(request.username, history, session_file)
                 sessions = load_chat_sessions(request.username)
                 choices = [(f"{s['preview']} ({s['timestamp'][:10]})", s['file']) for s in sessions]
-                return gr.Dropdown(choices=choices)
-            return gr.Dropdown(choices=[])
+                return gr.Dropdown(choices=choices), new_session_file
+            return gr.Dropdown(choices=[]), session_file
         
-        save_chat_btn.click(save_current_chat, inputs=[chatbot], outputs=[history_list])
+        save_chat_btn.click(save_current_chat, inputs=[chatbot, current_session_file], outputs=[history_list, current_session_file])
         
         def get_token_status_display(percentage: float, was_compacted: bool = False) -> str:
             """Gera o texto de status baseado na porcentagem de tokens."""
@@ -1045,10 +1069,11 @@ def setup_and_launch_gradio():
             if request and request.username and selected_file:
                 messages = load_chat_session(request.username, selected_file)
                 token_percentage = get_token_usage_percentage(messages)
-                return messages, token_percentage, get_token_status_display(token_percentage)
-            return [], 0, "🟢 0% - Conversa iniciada"
+                # Retorna também o arquivo de sessão para continuar editando o mesmo chat
+                return messages, token_percentage, get_token_status_display(token_percentage), selected_file
+            return [], 0, "🟢 0% - Conversa iniciada", None
         
-        load_chat_btn.click(load_previous_chat, inputs=[history_list], outputs=[chatbot, token_progress, token_status])
+        load_chat_btn.click(load_previous_chat, inputs=[history_list], outputs=[chatbot, token_progress, token_status, current_session_file])
         
         # Renomear chat
         def rename_selected_chat(selected_file: str, new_name: str, request: gr.Request):
@@ -1080,9 +1105,9 @@ def setup_and_launch_gradio():
         
         rename_btn.click(rename_selected_chat, inputs=[history_list, rename_input], outputs=[history_list, rename_input])
         
-        async def process_query(message: str, history: list, company: str, request: gr.Request):
+        async def process_query(message: str, history: list, company: str, session_file: str, request: gr.Request):
             username = request.username if request else "anonymous"
-            logger.info(f"[{username}] Nova consulta: '{message[:50]}...'")
+            logger.info(f"[{username}] Nova consulta: '{message[:50]}...' (sessão: {session_file})")
             
             was_compacted = False
             
@@ -1112,18 +1137,19 @@ def setup_and_launch_gradio():
             token_percentage = get_token_usage_percentage(history)
             token_status_text = get_token_status_display(token_percentage, was_compacted)
             
-            # Auto-salvar chat
+            # Auto-salvar chat (mantendo o mesmo arquivo de sessão)
+            new_session_file = session_file
             if username != "anonymous":
-                save_chat_history(username, history)
+                new_session_file = save_chat_history(username, history, session_file)
             
-            # Retorna o histórico atualizado e indicadores de tokens
-            return history, token_percentage, token_status_text
+            # Retorna o histórico atualizado, indicadores de tokens e o arquivo de sessão
+            return history, token_percentage, token_status_text, new_session_file
         
         submit_btn = gr.Button("Enviar")
         submit_btn.click(
             process_query,
-            inputs=[query_input, chatbot, company_radio],
-            outputs=[chatbot, token_progress, token_status]
+            inputs=[query_input, chatbot, company_radio, current_session_file],
+            outputs=[chatbot, token_progress, token_status, current_session_file]
         )
 
     # Parâmetros de autenticação

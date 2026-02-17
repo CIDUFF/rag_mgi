@@ -7,6 +7,9 @@ from typing import Dict, Any, Optional, List, Callable
 from dotenv import load_dotenv
 from types import SimpleNamespace
 
+# Carregar variáveis de ambiente ANTES de usá-las
+load_dotenv()
+
 # Adicionar o diretório raiz do projeto ao sys.path ANTES da importação local
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
