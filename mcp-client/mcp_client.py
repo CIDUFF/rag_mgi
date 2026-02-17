@@ -436,7 +436,7 @@ async def parallel_mcp_query(query: str, max_results: int = 5, target_server: st
                             name=tool_name_to_call,
                             arguments={"query": query, "max_results": max_results}
                         ),
-                        timeout=120.0
+                        timeout=300.0  # 5 minutos para primeira consulta (Ollama carrega modelo)
                     )
                     
                     # Processar resposta como antes...
