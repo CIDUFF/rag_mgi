@@ -5,6 +5,9 @@ import json
 import asyncio
 import traceback
 import logging
+import hashlib
+from datetime import datetime
+from pathlib import Path
 import gradio as gr
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -37,8 +40,8 @@ LLM_CALL = os.getenv("LLM_CALL_CLIENT", "API")  # "API" ou "Ollama"
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:30b")
 
 def strip_think_tags(text: str) -> str:
-    """Remove blocos <think>...</think> de modelos reasoning (ex: Qwen3, DeepSeek-R1)."""
-    return re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
+    """Remove blocos  comprehendidos de modelos reasoning (ex: Qwen3, DeepSeek-R1)."""
+    return re.sub(r' comprehendidos\s*', '', text, flags=re.DOTALL).strip()
 
 if LLM_CALL == "API" and not DEEPSEEK_API_KEY:
     logger.error("DEEPSEEK_API_KEY não encontrada e LLM_CALL='API'. Verifique o arquivo .env")
@@ -64,6 +67,259 @@ MCP_SERVERS = {
     "CEITEC": {"url": "http://localhost:8009/mcp/", "description": "Conhecimento CEITEC."},
     "IMBEL": {"url": "http://localhost:8010/mcp/", "description": "Conhecimento IMBEL."}
 }
+
+# ===== Sistema de Autenticação =====
+USERS_FILE = Path(__file__).parent / "users.json"
+CHAT_HISTORY_DIR = Path(__file__).parent / "chat_history"
+CHAT_HISTORY_DIR.mkdir(exist_ok=True)
+
+def load_users() -> dict:
+    """Carrega usuários do arquivo users.json."""
+    try:
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        users = {}
+        for u in data.get("users", []):
+            users[u["username"]] = {
+                "password": u["password"],
+                "nome": u.get("nome", u["username"])
+            }
+        logger.info(f"Carregados {len(users)} usuários do arquivo {USERS_FILE}")
+        return users
+    except FileNotFoundError:
+        logger.warning(f"Arquivo {USERS_FILE} não encontrado. Usando credenciais padrão.")
+        return {"admin": {"password": "mgi2024", "nome": "Administrador"}}
+    except Exception as e:
+        logger.error(f"Erro ao carregar usuários: {e}")
+        return {"admin": {"password": "mgi2024", "nome": "Administrador"}}
+
+AUTH_USERS = load_users()
+
+def authenticate(username: str, password: str) -> bool:
+    """Valida credenciais do usuário."""
+    if username in AUTH_USERS and AUTH_USERS[username]["password"] == password:
+        logger.info(f"Login bem-sucedido: {username}")
+        return True
+    logger.warning(f"Tentativa de login falhou para: {username}")
+    return False
+
+def get_user_display_name(username: str) -> str:
+    """Retorna o nome de exibição do usuário."""
+    if username in AUTH_USERS:
+        return AUTH_USERS[username].get("nome", username)
+    return username
+
+def save_chat_history(username: str, history: list):
+    """Salva o histórico de chat do usuário em arquivo JSON."""
+    try:
+        user_dir = CHAT_HISTORY_DIR / username
+        user_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath = user_dir / f"chat_{timestamp}.json"
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump({
+                "username": username,
+                "timestamp": datetime.now().isoformat(),
+                "messages": history
+            }, f, ensure_ascii=False, indent=2)
+        logger.info(f"Histórico salvo: {filepath}")
+    except Exception as e:
+        logger.error(f"Erro ao salvar histórico de {username}: {e}")
+
+def load_chat_sessions(username: str) -> list:
+    """Carrega lista de sessões de chat do usuário."""
+    user_dir = CHAT_HISTORY_DIR / username
+    if not user_dir.exists():
+        return []
+    sessions = []
+    for f in sorted(user_dir.glob("chat_*.json"), reverse=True):
+        try:
+            with open(f, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            first_msg = ""
+            for msg in data.get("messages", []):
+                if msg.get("role") == "user":
+                    first_msg = msg["content"][:80] + ("..." if len(msg["content"]) > 80 else "")
+                    break
+            sessions.append({
+                "file": f.name,
+                "timestamp": data.get("timestamp", ""),
+                "preview": first_msg or "Chat vazio",
+                "message_count": len(data.get("messages", []))
+            })
+        except Exception:
+            continue
+    return sessions
+
+def load_chat_session(username: str, filename: str) -> list:
+    """Carrega uma sessão de chat específica."""
+    filepath = CHAT_HISTORY_DIR / username / filename
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("messages", [])
+    except Exception as e:
+        logger.error(f"Erro ao carregar sessão {filename}: {e}")
+        return []
+
+def rename_chat_session(username: str, old_filename: str, new_name: str) -> tuple[bool, str]:
+    """
+    Renomeia uma sessão de chat.
+    
+    Args:
+        username: Nome do usuário
+        old_filename: Nome atual do arquivo
+        new_name: Novo nome desejado (sem extensão)
+    
+    Returns:
+        tuple: (sucesso, novo_filename ou mensagem de erro)
+    """
+    if not new_name or not new_name.strip():
+        return False, "Nome não pode ser vazio"
+    
+    # Sanitizar o novo nome (remover caracteres inválidos)
+    safe_name = re.sub(r'[^\w\s\-_]', '', new_name.strip())[:50]
+    if not safe_name:
+        return False, "Nome inválido após sanitização"
+    
+    user_dir = CHAT_HISTORY_DIR / username
+    old_path = user_dir / old_filename
+    
+    if not old_path.exists():
+        return False, "Arquivo não encontrado"
+    
+    # Criar novo nome de arquivo (preservar timestamp se existir)
+    timestamp_match = re.search(r'(\d{8}_\d{6})', old_filename)
+    if timestamp_match:
+        new_filename = f"{safe_name}_{timestamp_match.group(1)}.json"
+    else:
+        new_filename = f"{safe_name}.json"
+    
+    new_path = user_dir / new_filename
+    
+    # Verificar se já existe arquivo com esse nome
+    if new_path.exists() and new_path != old_path:
+        return False, "Já existe um chat com esse nome"
+    
+    try:
+        # Renomear o arquivo
+        old_path.rename(new_path)
+        logger.info(f"Chat renomeado: {old_filename} -> {new_filename}")
+        return True, new_filename
+    except Exception as e:
+        logger.error(f"Erro ao renomear chat: {e}")
+        return False, f"Erro ao renomear: {str(e)}"
+
+# ===== Sistema de Gerenciamento de Tokens e Contexto =====
+# Limites de tokens para DeepSeek (modelo deepseek-chat tem 64k de contexto)
+MAX_CONTEXT_TOKENS = 50000  # Limite seguro para input (deixando espaço para output)
+COMPACTION_THRESHOLD = 0.80  # Compactar quando atingir 80% do limite
+TOKENS_PER_CHAR = 0.25  # Estimativa: ~4 caracteres = 1 token para português
+
+def estimate_tokens(text: str) -> int:
+    """Estima o número de tokens em um texto (aproximação para português)."""
+    if not text:
+        return 0
+    return int(len(text) * TOKENS_PER_CHAR)
+
+def estimate_history_tokens(history: list) -> int:
+    """Estima o total de tokens no histórico de conversa."""
+    total = 0
+    for msg in history:
+        content = msg.get("content", "")
+        total += estimate_tokens(content)
+        # Adicionar overhead por mensagem (role, formatação)
+        total += 4
+    return total
+
+def get_token_usage_percentage(history: list) -> float:
+    """Retorna a porcentagem de tokens usados em relação ao limite."""
+    tokens_used = estimate_history_tokens(history)
+    return min((tokens_used / MAX_CONTEXT_TOKENS) * 100, 100.0)
+
+def should_compact_history(history: list) -> bool:
+    """Verifica se o histórico precisa ser compactado."""
+    usage = get_token_usage_percentage(history)
+    return usage >= (COMPACTION_THRESHOLD * 100)
+
+def compact_history(history: list) -> tuple[list, str]:
+    """
+    Compacta o histórico de conversa, resumindo mensagens antigas.
+    Mantém as últimas 4 mensagens intactas e resume o resto.
+    
+    Returns:
+        tuple: (histórico compactado, resumo gerado)
+    """
+    if len(history) <= 6:
+        return history, ""
+    
+    # Separar mensagens antigas das recentes
+    messages_to_summarize = history[:-4]
+    recent_messages = history[-4:]
+    
+    # Criar resumo das mensagens antigas
+    summary_parts = []
+    for msg in messages_to_summarize:
+        role = "Usuário" if msg.get("role") == "user" else "Assistente"
+        content = msg.get("content", "")[:500]  # Limitar tamanho
+        summary_parts.append(f"[{role}]: {content}")
+    
+    summary_text = "\n".join(summary_parts)
+    
+    # Criar prompt para resumo
+    summary_prompt = f"""Resuma de forma MUITO concisa (máximo 300 palavras) a seguinte conversa anterior, 
+mantendo apenas os pontos essenciais, decisões tomadas e informações importantes mencionadas:
+
+{summary_text}
+
+Formato do resumo:
+- Tópicos principais discutidos
+- Informações importantes mencionadas
+- Contexto relevante para continuidade"""
+    
+    # Gerar resumo usando a LLM
+    compacted_summary = ""
+    try:
+        if LLM_CALL == "API" and openai_client:
+            response = openai_client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": "Você é um assistente que faz resumos concisos de conversas."},
+                    {"role": "user", "content": summary_prompt}
+                ],
+                temperature=0.3,
+                max_tokens=500
+            )
+            compacted_summary = strip_think_tags(response.choices[0].message.content)
+        elif LLM_CALL == "Ollama":
+            ollama_llm = ChatOllama(model=OLLAMA_MODEL, temperature=0.3, num_gpu=1)
+            response = ollama_llm.invoke([
+                SystemMessage(content="Você é um assistente que faz resumos concisos de conversas."),
+                HumanMessage(content=summary_prompt)
+            ])
+            compacted_summary = strip_think_tags(response.content)
+    except Exception as e:
+        logger.error(f"Erro ao gerar resumo para compactação: {e}")
+        # Fallback: criar resumo simples
+        compacted_summary = f"[Resumo de {len(messages_to_summarize)} mensagens anteriores - contexto preservado]"
+    
+    # Criar histórico compactado
+    compacted_history = [
+        {"role": "system", "content": f"📋 **Resumo da conversa anterior:**\n{compacted_summary}"}
+    ] + recent_messages
+    
+    logger.info(f"Histórico compactado: {len(history)} mensagens -> {len(compacted_history)} mensagens")
+    return compacted_history, compacted_summary
+
+def format_history_for_api(history: list) -> list:
+    """Formata o histórico de chat para envio à API."""
+    formatted = []
+    for msg in history:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role in ["user", "assistant", "system"]:
+            formatted.append({"role": role, "content": content})
+    return formatted
 
 # Configurar device do cliente (CrossEncoder)
 CUDA_DEVICE_CLIENT = int(os.getenv("CUDA_DEVICE_CLIENT", "1"))
@@ -279,7 +535,7 @@ async def parallel_mcp_query(query: str, max_results: int = 5, target_server: st
             
     return results, errors
 
-def create_consolidated_summary(query: str, results_dict: dict) -> str:
+def create_consolidated_summary(query: str, results_dict: dict, chat_history: list = None) -> str:
     logger.info(f"Criando resumo consolidado para query: '{query[:50]}...'")
     valid_responses = []
     all_sources_dict = {} # Initialize as a dictionary
@@ -322,14 +578,32 @@ Você é um analista especializado em empresas estatais brasileiras (TELEBRAS, C
 - Produzir análises coesas, precisas e bem estruturadas
 - Manter rigor técnico e clareza na comunicação
 
+**REGRA CRÍTICA DE SEPARAÇÃO DE EMPRESAS (OBRIGATÓRIO):**
+
+⚠️ QUANDO O USUÁRIO PERGUNTAR ESPECIFICAMENTE SOBRE **UMA** EMPRESA:
+- Se perguntar sobre **IMBEL**: NÃO mencione NADA sobre CEITEC ou TELEBRAS. NÃO fale do mercado da CEITEC. NÃO fale do mercado da TELEBRAS. NÃO inclua notícias da CEITEC. NÃO inclua notícias da TELEBRAS. IGNORE completamente qualquer informação das outras duas empresas.
+- Se perguntar sobre **CEITEC**: NÃO mencione NADA sobre IMBEL ou TELEBRAS. NÃO fale do mercado da IMBEL. NÃO fale do mercado da TELEBRAS. NÃO inclua notícias da IMBEL. NÃO inclua notícias da TELEBRAS. IGNORE completamente qualquer informação das outras duas empresas.
+- Se perguntar sobre **TELEBRAS**: NÃO mencione NADA sobre IMBEL ou CEITEC. NÃO fale do mercado da IMBEL. NÃO fale do mercado da CEITEC. NÃO inclua notícias da IMBEL. NÃO inclua notícias da CEITEC. IGNORE completamente qualquer informação das outras duas empresas.
+
+🚫 O QUE NÃO FAZER (LISTA EXPLÍCITA):
+- NÃO adicione "contexto" de outras empresas quando a pergunta for sobre uma específica
+- NÃO faça comparações não solicitadas entre empresas
+- NÃO mencione "enquanto isso, na empresa X..." ou "por outro lado, a empresa Y..."
+- NÃO inclua dados de mercado, financeiros ou notícias de empresas não perguntadas
+- NÃO "complemente" a resposta com informações de outras empresas
+- NÃO sugira que o usuário "também pode se interessar" por outra empresa na resposta principal
+
+✅ A ÚNICA exceção é quando o usuário EXPLICITAMENTE pedir comparação entre empresas ou fizer uma pergunta geral sobre "as estatais" ou "todas as empresas".
+
 **INSTRUÇÕES DE ESTRUTURAÇÃO:**
 
 1. **Para perguntas sobre UMA empresa:**
-   - Foque EXCLUSIVAMENTE na empresa mencionada
-   - Ignore informações de outras empresas
+   - Foque EXCLUSIVAMENTE e UNICAMENTE na empresa mencionada
+   - IGNORE COMPLETAMENTE informações de outras empresas (mesmo que estejam disponíveis nos dados)
    - Estruture: Introdução breve → Análise detalhada → Conclusão
+   - Se os dados das FONTES incluírem informações de outras empresas, DESCARTE essas informações
 
-2. **Para perguntas comparativas ou gerais:**
+2. **Para perguntas comparativas ou gerais (SOMENTE quando explicitamente solicitado):**
    - Organize por empresa com subtítulos claros (## EMPRESA)
    - Após cobrir todas, adicione seção "### Análise Comparativa" (se relevante)
    - Destaque diferenças, similaridades e contextos únicos
@@ -360,35 +634,76 @@ Você é um analista especializado em empresas estatais brasileiras (TELEBRAS, C
 
 **TOM:**
 Profissional, objetivo, analítico. Evite prolixidade, mas garanta completude.
+
+**PROIBIÇÕES ABSOLUTAS:**
+- NUNCA mencione erros de servidores, falhas de conexão, timeouts ou problemas técnicos internos na resposta.
+- NUNCA exiba mensagens como "servidor com erro", "falha na comunicação", "timeout" ou qualquer informação técnica de infraestrutura.
+- Se uma fonte não retornou dados, simplesmente ignore-a e responda com as fontes disponíveis, sem mencionar a ausência.
+- NUNCA misture informações de empresas diferentes quando a pergunta for sobre UMA empresa específica.
+- NUNCA adicione "informações complementares" de CEITEC/TELEBRAS quando perguntarem sobre IMBEL.
+- NUNCA adicione "informações complementares" de IMBEL/TELEBRAS quando perguntarem sobre CEITEC.
+- NUNCA adicione "informações complementares" de IMBEL/CEITEC quando perguntarem sobre TELEBRAS.
+- NUNCA faça comparações entre empresas a menos que o usuário PEÇA EXPLICITAMENTE.
+- NUNCA inclua notícias, mercado ou dados de empresas não mencionadas na pergunta do usuário.
+
+**ENCERRAMENTO OBRIGATÓRIO:**
+Ao final de TODA resposta, você DEVE incluir uma seção de acompanhamento. Use o formato:
+
+---
+
+**Consigo ajudar em algo mais, como por exemplo:**
+- [Sugestão 1 relacionada ao tema da pergunta — ex: aprofundar algum ponto mencionado]
+- [Sugestão 2 — ex: explicar algum termo técnico que apareceu na resposta]
+- [Sugestão 3 — ex: comparar com outra empresa ou explorar um aspecto diferente]
+
+As sugestões devem ser ESPECÍFICAS e CONTEXTUAIS ao que foi perguntado e respondido, nunca genéricas. Ofereça explicações de termos técnicos, comparações entre empresas, detalhamentos de dados mencionados, ou explorações de temas adjacentes.
     """
     context_str = "\n\n".join([f"FONTE {r['server']}:\n{r['answer']}" for r in valid_responses])
     user_prompt_content = f"PERGUNTA: {query}\n\nDADOS DAS FONTES:\n{context_str}\n\nRESPOSTA SINTETIZADA:"
     
     synthesized_answer = ""
+    
+    # Construir mensagens incluindo histórico de conversa (se existir)
+    api_messages = [{"role": "system", "content": system_prompt_content}]
+    
+    # Adicionar histórico de conversa para manter contexto
+    if chat_history:
+        history_for_api = format_history_for_api(chat_history)
+        # Filtrar mensagens de sistema duplicadas e adicionar histórico
+        for msg in history_for_api:
+            if msg["role"] != "system":  # Evitar múltiplos system prompts
+                api_messages.append(msg)
+        logger.info(f"Incluindo {len(history_for_api)} mensagens de histórico no contexto")
+    
+    # Adicionar a pergunta atual
+    api_messages.append({"role": "user", "content": user_prompt_content})
 
     try:
         if LLM_CALL == "API":
             if not openai_client:
                 raise ValueError("Cliente OpenAI (DeepSeek API) não inicializado. Verifique DEEPSEEK_API_KEY.")
-            logger.info("Enviando para síntese LLM via API (DeepSeek)...")
+            logger.info(f"Enviando para síntese LLM via API (DeepSeek) com {len(api_messages)} mensagens...")
             api_response = openai_client.chat.completions.create(
                 model="deepseek-chat", 
-                messages=[
-                    {"role": "system", "content": system_prompt_content},
-                    {"role": "user", "content": user_prompt_content}
-                ],
+                messages=api_messages,
                 temperature=1.0, 
                 max_tokens=6000
             )
             synthesized_answer = strip_think_tags(api_response.choices[0].message.content)
         
         elif LLM_CALL == "Ollama":
-            logger.info(f"Enviando para síntese LLM via Ollama ({OLLAMA_MODEL})...")
+            logger.info(f"Enviando para síntese LLM via Ollama ({OLLAMA_MODEL}) com {len(api_messages)} mensagens...")
             ollama_llm = ChatOllama(model=OLLAMA_MODEL, temperature=1.0, num_gpu=1)
-            messages_for_ollama = [
-                SystemMessage(content=system_prompt_content),
-                HumanMessage(content=user_prompt_content)
-            ]
+            # Converter para formato LangChain
+            messages_for_ollama = []
+            for msg in api_messages:
+                if msg["role"] == "system":
+                    messages_for_ollama.append(SystemMessage(content=msg["content"]))
+                elif msg["role"] == "user":
+                    messages_for_ollama.append(HumanMessage(content=msg["content"]))
+                elif msg["role"] == "assistant":
+                    from langchain_core.messages import AIMessage
+                    messages_for_ollama.append(AIMessage(content=msg["content"]))
             response_ollama = ollama_llm.invoke(messages_for_ollama)
             synthesized_answer = strip_think_tags(response_ollama.content)
         
@@ -471,7 +786,7 @@ async def async_rag_mcp_response(message: str, history: list, mode: str = "aggre
         return f"Erro ao consultar bases: {error_msgs}"
 
     if mode == "aggregated":
-        final_response_str = create_consolidated_summary(message, results_data)
+        final_response_str = create_consolidated_summary(message, results_data, chat_history=history)
     else:
         if mode in results_data and results_data[mode] and "content" in results_data[mode]:
             content = results_data[mode]["content"]
@@ -487,10 +802,10 @@ async def async_rag_mcp_response(message: str, history: list, mode: str = "aggre
     processing_time_total = time.time() - start_time_main
     logger.info(f"Processamento total da consulta: {processing_time_total:.2f}s.")
     
-    if errors_list and (mode != "aggregated" or not any(err_msg.startswith(mode) for err_msg in errors_list)):
-        filtered_errors = [e for e in errors_list if not e.startswith(f"{mode}:")] if mode != "aggregated" else errors_list
-        if filtered_errors:
-            final_response_str += f"\n\nObs: Outros servidores com erros: {', '.join(filtered_errors)}"
+    # Logar erros internamente, mas NUNCA expor ao usuário
+    if errors_list:
+        logger.warning(f"Erros internos (não exibidos ao usuário): {', '.join(errors_list)}")
+    
     return final_response_str
 
 async def rag_aggregated_response_async(message, history):
@@ -529,13 +844,64 @@ async def check_server_availability(name: str, url: str) -> tuple[bool, list[str
         return False, msg
 
 def setup_and_launch_gradio():
-    with gr.Blocks(title="Chat RAG MGI", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="Chat RAG MGI", theme=gr.themes.Soft(), css="""
+        .user-header { 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+            padding: 8px 16px; 
+            background: linear-gradient(135deg, #1a5276, #2e86c1);
+            border-radius: 8px; 
+            margin-bottom: 12px;
+            color: white;
+        }
+        .user-header span { font-size: 14px; }
+        .user-header .username { font-weight: bold; font-size: 15px; }
+        .history-item {
+            padding: 8px 12px;
+            margin: 4px 0;
+            border-radius: 6px;
+            border: 1px solid #e0e0e0;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        .history-item:hover { background: #f0f4f8; }
+        .logout-btn {
+            background: rgba(255,255,255,0.2) !important;
+            border: 1px solid rgba(255,255,255,0.4) !important;
+            color: white !important;
+            padding: 4px 12px !important;
+            border-radius: 4px !important;
+            font-size: 13px !important;
+            min-width: auto !important;
+        }
+        .logout-btn:hover {
+            background: rgba(255,255,255,0.3) !important;
+        }
+    """) as demo:
+        
+        # Header com info do usuário e logout
+        with gr.Row(elem_classes="user-header"):
+            user_display = gr.Markdown("")
+            logout_btn = gr.Button("Sair", elem_classes="logout-btn", size="sm", scale=0)
+        
+        # Função de logout (recarrega a página para forçar novo login)
+        logout_btn.click(
+            fn=None,
+            js="() => { window.location.href = window.location.pathname; }"
+        )
+        
         gr.Markdown("# Chat RAG Unificado - MGI")
         gr.Markdown("Faça uma pergunta para consultar as bases de conhecimento TELEBRAS, CEITEC e IMBEL.")
         
         with gr.Row():
             with gr.Column(scale=7):
-                chatbot = gr.Chatbot(height=600, label="Chat Consolidado", type='messages')
+                chatbot = gr.Chatbot(
+                    height=600, 
+                    label="Chat Consolidado", 
+                    type='messages',
+                    show_copy_button=True  # Botão de copiar em cada mensagem
+                )
                 query_input = gr.Textbox(placeholder="Digite sua pergunta...", container=False)
             
             with gr.Column(scale=3):
@@ -545,40 +911,179 @@ def setup_and_launch_gradio():
                     value="Todas"
                 )
                 
-                topic_radio = gr.Radio(
-                    choices=["Geral", "Finanças", "Projetos", "Produtos", "Institucional"],
-                    label="Tópico específico (opcional)",
-                    value="Geral"
+                gr.Markdown("---")
+                
+                # Indicador de uso de tokens
+                gr.Markdown("### Uso do Contexto")
+                token_progress = gr.Slider(
+                    minimum=0, maximum=100, value=0, 
+                    label="Capacidade da conversa",
+                    interactive=False,
+                    info="Quando chegar a 80%, a conversa será resumida automaticamente para liberar espaço."
                 )
+                token_status = gr.Markdown("🟢 0% - Conversa iniciada")
+                
+                gr.Markdown("---")
+                gr.Markdown("### Histórico de Chats")
+                
+                new_chat_btn = gr.Button("🆕 Novo Chat", variant="primary", size="sm")
+                save_chat_btn = gr.Button("💾 Salvar Chat", variant="secondary", size="sm")
+                
+                history_list = gr.Dropdown(
+                    label="Conversas anteriores",
+                    choices=[],
+                    interactive=True
+                )
+                load_chat_btn = gr.Button("📂 Carregar Conversa", size="sm")
+                
+                with gr.Row():
+                    rename_input = gr.Textbox(
+                        placeholder="Novo nome...",
+                        container=False,
+                        scale=3,
+                        max_lines=1
+                    )
+                    rename_btn = gr.Button("✏️", size="sm", scale=1)
         
-        async def process_query(message: str, history: list, company: str, topic: str):
-            # Modificar a consulta com base nas seleções
+        # Exibir nome do usuário logado no header
+        def show_user_info(request: gr.Request):
+            if request and request.username:
+                display_name = get_user_display_name(request.username)
+                return f"👤 **{display_name}** ({request.username})"
+            return "👤 Não identificado"
+        
+        demo.load(show_user_info, inputs=None, outputs=user_display)
+        
+        # Carregar lista de sessões ao abrir
+        def load_user_sessions(request: gr.Request):
+            if request and request.username:
+                sessions = load_chat_sessions(request.username)
+                choices = [(f"{s['preview']} ({s['timestamp'][:10]})", s['file']) for s in sessions]
+                return gr.Dropdown(choices=choices)
+            return gr.Dropdown(choices=[])
+        
+        demo.load(load_user_sessions, inputs=None, outputs=history_list)
+        
+        # Novo chat
+        def new_chat():
+            return [], "", 0, "🟢 0% - Conversa iniciada"
+        
+        new_chat_btn.click(new_chat, outputs=[chatbot, query_input, token_progress, token_status])
+        
+        # Salvar chat
+        def save_current_chat(history: list, request: gr.Request):
+            if request and request.username and history:
+                save_chat_history(request.username, history)
+                sessions = load_chat_sessions(request.username)
+                choices = [(f"{s['preview']} ({s['timestamp'][:10]})", s['file']) for s in sessions]
+                return gr.Dropdown(choices=choices)
+            return gr.Dropdown(choices=[])
+        
+        save_chat_btn.click(save_current_chat, inputs=[chatbot], outputs=[history_list])
+        
+        def get_token_status_display(percentage: float, was_compacted: bool = False) -> str:
+            """Gera o texto de status baseado na porcentagem de tokens."""
+            if was_compacted:
+                return f"🔄 {percentage:.0f}% - Conversa foi resumida automaticamente"
+            elif percentage < 50:
+                return f"🟢 {percentage:.0f}% - Amplo espaço disponível"
+            elif percentage < 80:
+                return f"🟡 {percentage:.0f}% - Moderado"
+            else:
+                return f"🟠 {percentage:.0f}% - Próximo do limite (será resumido em breve)"
+        
+        # Carregar conversa anterior
+        def load_previous_chat(selected_file: str, request: gr.Request):
+            if request and request.username and selected_file:
+                messages = load_chat_session(request.username, selected_file)
+                token_percentage = get_token_usage_percentage(messages)
+                return messages, token_percentage, get_token_status_display(token_percentage)
+            return [], 0, "🟢 0% - Conversa iniciada"
+        
+        load_chat_btn.click(load_previous_chat, inputs=[history_list], outputs=[chatbot, token_progress, token_status])
+        
+        # Renomear chat
+        def rename_selected_chat(selected_file: str, new_name: str, request: gr.Request):
+            if not request or not request.username:
+                gr.Warning("Usuário não identificado")
+                return gr.Dropdown(choices=[]), ""
+            
+            if not selected_file:
+                gr.Warning("Selecione uma conversa para renomear")
+                return gr.Dropdown(choices=[]), new_name
+            
+            if not new_name or not new_name.strip():
+                gr.Warning("Digite um nome para a conversa")
+                return gr.Dropdown(choices=[]), new_name
+            
+            success, result = rename_chat_session(request.username, selected_file, new_name)
+            
+            if success:
+                gr.Info(f"Conversa renomeada com sucesso!")
+                # Atualizar lista de sessões
+                sessions = load_chat_sessions(request.username)
+                choices = [(f"{s['preview']} ({s['timestamp'][:10]})", s['file']) for s in sessions]
+                return gr.Dropdown(choices=choices, value=result), ""
+            else:
+                gr.Warning(f"Erro: {result}")
+                sessions = load_chat_sessions(request.username)
+                choices = [(f"{s['preview']} ({s['timestamp'][:10]})", s['file']) for s in sessions]
+                return gr.Dropdown(choices=choices), new_name
+        
+        rename_btn.click(rename_selected_chat, inputs=[history_list, rename_input], outputs=[history_list, rename_input])
+        
+        async def process_query(message: str, history: list, company: str, request: gr.Request):
+            username = request.username if request else "anonymous"
+            logger.info(f"[{username}] Nova consulta: '{message[:50]}...'")
+            
+            was_compacted = False
+            
+            # Verificar se precisa compactar o histórico ANTES de adicionar a nova mensagem
+            if should_compact_history(history):
+                logger.info(f"[{username}] Histórico próximo do limite, compactando...")
+                history, summary = compact_history(history)
+                was_compacted = True
+                if summary:
+                    logger.info(f"[{username}] Histórico compactado. Resumo: {summary[:100]}...")
+            
+            # Modificar a consulta com base na empresa selecionada
             enhanced_query = message
             if company != "Todas":
                 enhanced_query = f"[{company}] {enhanced_query}"
-            if topic != "Geral":
-                enhanced_query = f"[{topic}] {enhanced_query}"
             
             # Adiciona a mensagem do usuário ao histórico no formato correto
             history.append({"role": "user", "content": message})
             
-            # Await a chamada de função assíncrona
-            # Passando um histórico vazio para async_rag_mcp_response, pois ele não utiliza o histórico de chat para contexto.
-            bot_response_string = await async_rag_mcp_response(enhanced_query, [], "aggregated")
+            # Passar o histórico para manter contexto da conversa
+            bot_response_string = await async_rag_mcp_response(enhanced_query, history, "aggregated")
             
             # Adiciona a resposta do bot ao histórico no formato correto
             history.append({"role": "assistant", "content": bot_response_string})
             
-            # Retorna o histórico atualizado
-            return history
+            # Calcular uso de tokens após a resposta
+            token_percentage = get_token_usage_percentage(history)
+            token_status_text = get_token_status_display(token_percentage, was_compacted)
+            
+            # Auto-salvar chat
+            if username != "anonymous":
+                save_chat_history(username, history)
+            
+            # Retorna o histórico atualizado e indicadores de tokens
+            return history, token_percentage, token_status_text
         
         submit_btn = gr.Button("Enviar")
         submit_btn.click(
             process_query,
-            inputs=[query_input, chatbot, company_radio, topic_radio],
-            outputs=chatbot
+            inputs=[query_input, chatbot, company_radio],
+            outputs=[chatbot, token_progress, token_status]
         )
 
+    # Parâmetros de autenticação
+    auth_params = {
+        "auth": authenticate,
+        "auth_message": "🔐 Chat RAG MGI - Sistema de Consulta\n\nInsira suas credenciais para acessar o sistema."
+    }
+    
     env_port = os.getenv("GRADIO_SERVER_PORT")
     port_to_use = 0
     if env_port:
@@ -591,7 +1096,7 @@ def setup_and_launch_gradio():
     
     if port_to_use > 0:
         try:
-            demo.launch(share=False, server_name="0.0.0.0", server_port=port_to_use, show_error=True, debug=True, prevent_thread_lock=True)
+            demo.launch(share=False, server_name="0.0.0.0", server_port=port_to_use, show_error=True, debug=True, prevent_thread_lock=True, **auth_params)
             return # Sucesso
         except Exception as e_launch:
             logger.error(f"Erro ao usar porta {port_to_use} da variável de ambiente: {e_launch}", exc_info=True)
@@ -602,7 +1107,7 @@ def setup_and_launch_gradio():
     for port_val in ports_to_try:
         try:
             logger.info(f"Tentando iniciar Gradio na porta {port_val}...")
-            demo.launch(share=False, server_name="0.0.0.0", server_port=port_val, show_error=True, debug=True, prevent_thread_lock=True)
+            demo.launch(share=False, server_name="0.0.0.0", server_port=port_val, show_error=True, debug=True, prevent_thread_lock=True, **auth_params)
             break 
         except OSError as e_os:
             if "address already in use" in str(e_os).lower() or "cannot assign requested address" in str(e_os).lower():
