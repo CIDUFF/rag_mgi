@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import json
 import asyncio
@@ -31,8 +32,13 @@ from langchain_core.messages import SystemMessage, HumanMessage # Para formatar 
 load_dotenv()
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
-# Adicionar a nova variável de configuração LLM_CALL
-LLM_CALL = "API"  # Pode ser "API" ou "Ollama"
+# Configuração LLM via .env (cliente usa síntese, pode ser diferente dos servidores)
+LLM_CALL = os.getenv("LLM_CALL_CLIENT", "API")  # "API" ou "Ollama"
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:30b")
+
+def strip_think_tags(text: str) -> str:
+    """Remove blocos <think>...</think> de modelos reasoning (ex: Qwen3, DeepSeek-R1)."""
+    return re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
 
 if LLM_CALL == "API" and not DEEPSEEK_API_KEY:
     logger.error("DEEPSEEK_API_KEY não encontrada e LLM_CALL='API'. Verifique o arquivo .env")
@@ -59,11 +65,15 @@ MCP_SERVERS = {
     "IMBEL": {"url": "http://localhost:8010/mcp/", "description": "Conhecimento IMBEL."}
 }
 
+# Configurar device do cliente (CrossEncoder)
+CUDA_DEVICE_CLIENT = int(os.getenv("CUDA_DEVICE_CLIENT", "1"))
+CLIENT_DEVICE = f'cuda:{CUDA_DEVICE_CLIENT}'
+
 # Inicializar o CrossEncoder para reranking local
 try:
-    cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L6-v2")
+    cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L6-v2", device=CLIENT_DEVICE)
     RERANKING_ENABLED = True
-    logger.info("CrossEncoder para reranking local inicializado com sucesso")
+    logger.info(f"CrossEncoder para reranking local inicializado com sucesso em {CLIENT_DEVICE}")
 except Exception as e:
     logger.warning(f"Não foi possível inicializar o CrossEncoder: {e}")
     RERANKING_ENABLED = False
@@ -303,18 +313,53 @@ def create_consolidated_summary(query: str, results_dict: dict) -> str:
     
     logger.info(f"Sintetizando {len(valid_responses)} respostas usando {LLM_CALL}...")
     
-    # Prompt para a síntese do LLM
+    # Prompt aprimorado para síntese de alta qualidade
     system_prompt_content = """
-    Sintetize as seguintes informações de diferentes fontes (TELEBRAS, CEITEC, IMBEL) sobre empresas estatais brasileiras. 
-    
-    INSTRUÇÕES IMPORTANTES:
-    1. Responda em português do Brasil, seja coeso e não invente dados.
-    2. Se a pergunta for específica sobre uma única empresa, foque APENAS nessa empresa.
-    3. Evite misturar informações de empresas diferentes na mesma seção da resposta.
-    4. Para perguntas sobre finanças, utilize terminologia financeira precisa.
-    5. Para perguntas sobre projetos, estruture cronologicamente.
-    6. Cite explicitamente a empresa de origem de cada informação.
-    7. Se a pergunta feita pelo usuário não tiver relação com as empresas estatais, informe que não há contexto relevante disponível.
+Você é um analista especializado em empresas estatais brasileiras (TELEBRAS, CEITEC, IMBEL), com expertise em síntese de informações complexas de múltiplas fontes.
+
+**SEU PAPEL:**
+- Sintetizar respostas de 3 bases de conhecimento especializadas
+- Produzir análises coesas, precisas e bem estruturadas
+- Manter rigor técnico e clareza na comunicação
+
+**INSTRUÇÕES DE ESTRUTURAÇÃO:**
+
+1. **Para perguntas sobre UMA empresa:**
+   - Foque EXCLUSIVAMENTE na empresa mencionada
+   - Ignore informações de outras empresas
+   - Estruture: Introdução breve → Análise detalhada → Conclusão
+
+2. **Para perguntas comparativas ou gerais:**
+   - Organize por empresa com subtítulos claros (## EMPRESA)
+   - Após cobrir todas, adicione seção "### Análise Comparativa" (se relevante)
+   - Destaque diferenças, similaridades e contextos únicos
+
+3. **Para perguntas técnicas/financeiras:**
+   - Use terminologia precisa (EBITDA, CAPEX, ROI, etc.)
+   - Apresente dados quantitativos quando disponíveis
+   - Inclua contexto temporal ("em 2023", "no último triênio")
+
+4. **Para perguntas sobre projetos/cronogramas:**
+   - Estruture cronologicamente
+   - Destaque marcos importantes, status atual e previsões
+   - Mencione riscos ou desafios identificados
+
+**REGRAS DE CITAÇÃO:**
+- Atribua cada informação à empresa fonte ("Segundo dados da TELEBRAS...")
+- Para dados específicos, cite diretamente: "A CEITEC reportou..."
+- Não invente dados nem misture informações de fontes diferentes
+
+**FORMATAÇÃO:**
+- Use Markdown: títulos (##), listas, **negrito** para ênfase
+- Parágrafos concisos (3-5 linhas)
+- Listas para múltiplos itens
+
+**LIMITAÇÕES:**
+- Se a pergunta não relacionar-se às empresas, responda: "Esta pergunta está fora do escopo. Posso ajudar com informações sobre TELEBRAS, CEITEC ou IMBEL."
+- Se faltar informação: "Os dados disponíveis não cobrem [aspecto X]. Posso detalhar [aspecto Y]."
+
+**TOM:**
+Profissional, objetivo, analítico. Evite prolixidade, mas garanta completude.
     """
     context_str = "\n\n".join([f"FONTE {r['server']}:\n{r['answer']}" for r in valid_responses])
     user_prompt_content = f"PERGUNTA: {query}\n\nDADOS DAS FONTES:\n{context_str}\n\nRESPOSTA SINTETIZADA:"
@@ -335,17 +380,17 @@ def create_consolidated_summary(query: str, results_dict: dict) -> str:
                 temperature=1.0, 
                 max_tokens=6000
             )
-            synthesized_answer = api_response.choices[0].message.content
+            synthesized_answer = strip_think_tags(api_response.choices[0].message.content)
         
         elif LLM_CALL == "Ollama":
-            logger.info("Enviando para síntese LLM via Ollama (deepseek-llm)...")
-            ollama_llm = ChatOllama(model="deepseek-llm", temperature=1.0) # Adicione outros parâmetros se necessário
+            logger.info(f"Enviando para síntese LLM via Ollama ({OLLAMA_MODEL})...")
+            ollama_llm = ChatOllama(model=OLLAMA_MODEL, temperature=1.0, num_gpu=1)
             messages_for_ollama = [
                 SystemMessage(content=system_prompt_content),
                 HumanMessage(content=user_prompt_content)
             ]
             response_ollama = ollama_llm.invoke(messages_for_ollama)
-            synthesized_answer = response_ollama.content
+            synthesized_answer = strip_think_tags(response_ollama.content)
         
         else:
             logger.error(f"Valor de LLM_CALL ('{LLM_CALL}') não reconhecido. Não foi possível sintetizar.")

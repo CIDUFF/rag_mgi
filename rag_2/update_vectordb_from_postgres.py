@@ -31,8 +31,9 @@ if project_root not in sys.path:
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
+import torch
 
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 
@@ -47,10 +48,19 @@ load_dotenv()
 DB_CONFIG = {
     'host': os.getenv('DB_HOST', 'localhost'),
     'port': int(os.getenv('DB_PORT', 5432)),
-    'database': os.getenv('DB_NAME', 'mgi_raspagem'),
+    'database': os.getenv('DB_NAME', 'lei_bem'),
     'user': os.getenv('DB_USER'),
     'password': os.getenv('DB_PASSWORD')
 }
+
+# Configuração de dispositivo (GPU/CPU)
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+if DEVICE == 'cuda':
+    GPU_NAME = torch.cuda.get_device_name(0)
+    GPU_MEM = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    print(f"[GPU] Usando {GPU_NAME} ({GPU_MEM:.1f} GB VRAM)")
+else:
+    print("[CPU] GPU não disponível, usando CPU")
 
 # Validar configurações do banco
 if not DB_CONFIG['user'] or not DB_CONFIG['password']:
@@ -79,7 +89,7 @@ EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 # Configurações de paralelização
 DEFAULT_WORKERS = min(mp.cpu_count(), 8)  # Limitar a 8 workers
-BATCH_SIZE = 100  # Tamanho do batch para embeddings
+BATCH_SIZE = 256 if DEVICE == 'cuda' else 100  # Batch maior para GPU
 
 # Mapeamento de termos de busca para empresas
 TERMOS_EMPRESA = {
@@ -527,10 +537,11 @@ def atualizar_banco_vetorial(empresa: str, chunks: List[Document], registro: Dic
         return None
     
     # Criar embeddings
-    print(f"\nCriando embeddings com modelo {EMBEDDING_MODEL}...")
+    print(f"\nCriando embeddings com modelo {EMBEDDING_MODEL} no dispositivo {DEVICE}...")
     embeddings = HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL,
-        encode_kwargs={'batch_size': BATCH_SIZE}
+        model_kwargs={'device': DEVICE},
+        encode_kwargs={'batch_size': BATCH_SIZE, 'device': DEVICE, 'normalize_embeddings': True}
     )
     
     # Carregar banco existente

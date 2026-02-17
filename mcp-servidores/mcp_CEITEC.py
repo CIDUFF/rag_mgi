@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import time
 import asyncio
 from typing import Dict, Any, Optional, List, Callable
@@ -11,21 +12,20 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-# Importar do módulo RAG específico do CEITEC
-from rag_2.rag_cria_bd_CEITEC import (
-    create_vectorstore,
-    load_processed_files,
-    save_processed_files,
-    calculate_file_hash,
-    DEFAULT_BASE_PATHS_CEITEC
-)
-from langchain_community.embeddings import HuggingFaceEmbeddings
+# Importações locais
+import json
+import torch
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain.prompts import PromptTemplate
 from langchain_deepseek import ChatDeepSeek
-from langchain_community.chat_models import ChatOllama # Adicionar importação do ChatOllama
+from langchain_community.chat_models import ChatOllama
 from langchain.chains import RetrievalQA
 from contextlib import asynccontextmanager
+
+# Configuração de dispositivo (GPU/CPU)
+CUDA_DEVICE = int(os.getenv("CUDA_DEVICE_CEITEC", "0"))
+DEVICE = f'cuda:{CUDA_DEVICE}' if torch.cuda.is_available() else 'cpu'
 
 # Importações para reranking
 from langchain.retrievers import ContextualCompressionRetriever
@@ -38,43 +38,45 @@ from fastmcp import FastMCP, Context
 
 # Definir as constantes de configuração
 CHROMA_DB_DIR_CEITEC = "./chroma_db_semantic_CEITEC"
-EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
+PROCESSED_FILES_RECORD = "./processed_files_CEITEC.json"
+EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 INITIAL_RETRIEVAL_K = 30  # Recuperação inicial mais ampla
-LLM_CALL = "API"  # Pode ser "API" ou "Ollama"
+LLM_CALL = os.getenv("LLM_CALL_SERVER", "Ollama")  # "API" ou "Ollama" — configurável via .env
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:30b")
+
+def strip_think_tags(text: str) -> str:
+    """Remove blocos <think>...</think> de modelos reasoning (ex: Qwen3, DeepSeek-R1)."""
+    return re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
 
 # Verificar se a chave de API Cohere está definida
 # COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 USE_CROSS_ENCODER = True  # Determina se deve usar CrossEncoder local se a API Cohere não estiver disponível
 
+def load_processed_files() -> dict:
+    """Carrega o registro de arquivos processados."""
+    if os.path.exists(PROCESSED_FILES_RECORD):
+        try:
+            with open(PROCESSED_FILES_RECORD, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
 async def initialize_vectorstore():
     try:
-        processed_files_record = load_processed_files()
-
         if os.path.exists(CHROMA_DB_DIR_CEITEC) and os.path.isdir(CHROMA_DB_DIR_CEITEC):
             print(f"Carregando base de dados vetorial existente de {CHROMA_DB_DIR_CEITEC}...")
-            embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+            embeddings = HuggingFaceEmbeddings(
+                model_name=EMBEDDING_MODEL,
+                model_kwargs={'device': DEVICE},
+                encode_kwargs={'device': DEVICE, 'normalize_embeddings': True}
+            )
             vectorstore = Chroma(persist_directory=CHROMA_DB_DIR_CEITEC, embedding_function=embeddings)
-            print(f"Base de dados vetorial existente carregada.")
-
-            if len(processed_files_record) == 0:
-                print("Registro de arquivos processados vazio ou inexistente. Criando novo registro...")
-                novo_registro = {}
-                for base_path in DEFAULT_BASE_PATHS_CEITEC:
-                    if os.path.exists(base_path) and os.path.isdir(base_path):
-                        print(f"Escaneando documentos em: {base_path}")
-                        for root, _, files_in_dir in os.walk(base_path):
-                            for file_item in files_in_dir:
-                                if file_item.endswith('.md'):
-                                    file_path = os.path.join(root, file_item)
-                                    novo_registro[file_path] = calculate_file_hash(file_path)
-                print(f"Salvando registro de {len(novo_registro)} arquivos existentes...")
-                save_processed_files(novo_registro)
-                processed_files_record = novo_registro
-            print(f"Base de dados vetorial existente carregada. Registro contém {len(processed_files_record)} arquivos.")
+            registro = load_processed_files()
+            total_chunks = registro.get('total_chunks', 'N/A')
+            print(f"Base de dados vetorial CEITEC carregada. Chunks: {total_chunks}")
         else:
-            print(f"Base de dados vetorial não encontrada em {CHROMA_DB_DIR_CEITEC}. Criando nova base...")
-            vectorstore = create_vectorstore(base_paths=DEFAULT_BASE_PATHS_CEITEC, chroma_db_dir=CHROMA_DB_DIR_CEITEC)
-            print("Base de dados vetorial criada com sucesso.")
+            raise FileNotFoundError(f"Base vetorial não trovata em {CHROMA_DB_DIR_CEITEC}. Execute rag_rebuild_from_postgres.py primeiro.")
         return vectorstore
     except Exception as e:
         print(f"Erro ao inicializar base de dados vetorial para CEITEC: {e}")
@@ -153,7 +155,7 @@ def initialize_rag_chain(vectorstore):
         llm = ChatDeepSeek(model="deepseek-chat", temperature=1.0, max_tokens=5000, timeout=None, max_retries=3)
     elif LLM_CALL == "Ollama":
         print("Usando LLM via Ollama: deepseek-llm para CEITEC")
-        llm = ChatOllama(model="deepseek-llm", temperature=1.0, top_k=40, top_p=0.9, num_ctx=4096) # Ajuste os parâmetros conforme necessário
+        llm = ChatOllama(model=OLLAMA_MODEL, temperature=1.0, top_k=40, top_p=0.9, num_ctx=4096)
     else:
         print(f"AVISO (CEITEC): Valor de LLM_CALL ('{LLM_CALL}') não reconhecido. Usando ChatDeepSeek por padrão.")
         llm = ChatDeepSeek(model="deepseek-chat", temperature=1.0, max_tokens=5000, timeout=None, max_retries=3)
@@ -222,7 +224,7 @@ async def query_ceitec(query: str, max_results: int = 15, ctx: Context = None) -
     processing_time = time.time() - start_time
 
     result = {
-        "answer": response["result"],
+        "answer": strip_think_tags(response["result"]),
         "sources": [doc.metadata['source'] for doc in response["source_documents"][:max_results]],
         "processing_time": processing_time
     }
@@ -349,6 +351,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 8009))
     load_dotenv()
     print(f"Iniciando servidor MCP para CEITEC na porta {port}...")
+    print(f"Usando dispositivo: {DEVICE}")
     mcp.run(
         transport="streamable-http",
         host="0.0.0.0",
